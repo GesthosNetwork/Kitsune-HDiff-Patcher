@@ -1,34 +1,19 @@
-## Hoyo-Hdiff-Patcher: a tool for manually updating Hoyo Games properly
+## Kitsune HDiff Patcher
 
-Copying the update files directly into the game folder is not the correct update method. You must merge the `.pck.hdiff` files with the original `.pck` files and remove the outdated files listed in `deletefiles.txt`. You can perform this process using the following tool.
+A file update utility based on binary diff technology, featuring file verification and incremental patching.
 
-### Requirements
-- Install [python](https://www.python.org/downloads/)
+
+## Compile Instructions
+
+1. Install [.NET 10.0 SDK](https://dotnet.microsoft.com/download/dotnet/10.0)  
+2. Run `Compile.bat`  
+3. Output will be in `bin` folder.
+
 
 ### How to use
 
-1. Place the following files in the same folder as `exe` game:
-   - `7z.exe`
-   - `hpatchz.exe`
-   - `patch.py`
-   - `run.bat`
-
-   for example
-```
-├── GenshinImpact_Data/
-├── Audio_English(US)_pkg_version
-├── config.ini
-├── GenshinImpact.exe
-├── HoYoKProtect.sys
-├── mhypbase.dll
-├── pkg_version
-├── audio_en-us_6.3.0_6.4.0_hdiff.7z
-├── game_6.3.0_6.4.0_hdiff.7z
-├── 7z.exe
-├── hpatchz.exe
-├── patch.py
-├── run.bat
-```
+1. Place `Kitsune.exe` in the same folder as the game executable.
+   For example
 
 ```
 ├── StarRail_Data/
@@ -38,12 +23,9 @@ Copying the update files directly into the game folder is not the correct update
 ├── mhypbase.dll
 ├── pkg_version
 ├── StarRail.exe
-├── audio_en-us_4.0.0_4.1.0_hdiff_onQOZsbZUSMXxqsB.7z
-├── game_4.0.0_4.1.0_hdiff_xvkUBFdUirbKjhAn.7z
-├── 7z.exe
-├── hpatchz.exe
-├── patch.py
-├── run.bat
+├── audio_en-us_4.3.0_4.4.0_hdiff_AvVBHumYjUCykkeT.7z
+├── game_4.3.0_4.4.0_hdiff_DfvdjuyyZStZvKfL.7z
+├── Kitsune.exe
 ```
 
 ```
@@ -56,24 +38,65 @@ Copying the update files directly into the game folder is not the correct update
 ├── GameAssembly.dll
 ├── HoYoKProtect.sys
 ├── ......
-├── audio_en-us_2.6.0_2.7.0_hdiff_iFwzjdunKqmrHseM.zip
-├── game_2.6.0_2.7.0_hdiff_xAsDGeadnSffSJTY.zip
+├── audio_en-us_2.8.0_3.0.0_hdiff_IGmmwJHVnkQfcVau.zip
+├── game_2.8.0_3.0.0_hdiff_BvCYYtlnQuZZQaFw.zip
 ├── UnityPlayer.dll
 ├── version_info
 ├── ZenlessZoneZero.exe
-├── 7z.exe
-├── hpatchz.exe
-├── patch.py
-├── run.bat
+├── Kitsune.exe
+```
+```
+├── GenshinImpact_Data/
+├── Audio_English(US)_pkg_version
+├── config.ini
+├── GenshinImpact.exe
+├── HoYoKProtect.sys
+├── mhypbase.dll
+├── pkg_version
+├── audio_en-us_5.4.0_5.5.0_hdiff_HveRbpmNrNejbGYL.zip
+├── game_5.4.0_5.5.0_hdiff_IlvHovyEdpXnwiCH.zip
+├── Kitsune.exe
 ```
 
-2. Click `run.bat` and wait until the process finishes.
-3. Now, your game is updated!
-  
-- The overview of merging process:
+
+2. Run `Kitsune.exe`.
+
+3. Kitsune will:
+   - Extract the required update data.
+   - Apply binary diff patches.
+   - Verify the resulting files after the update process.
+
+4. Once the process is completed, your game files are updated.
+
+- Overview of the update process:
+
     ```
-    Banks0.pck (59.5 MB)        // before update
-    + Banks0.pck.hdiff (3.0 MB) // hdiff update
-    -----------------------------
-    = Banks0.pck (62.5 MB)      // new size after update
-	```
+    Extract required update data
+            |
+            v
+    Banks0.pck (59.5 MB)        // current file
+            +
+    Banks0.pck.hdiff (3.0 MB)   // incremental update data
+            |
+            v
+    Apply binary diff
+            |
+            v
+    Banks0.pck (62.5 MB)        // updated file
+            |
+            v
+    Verify updated files
+    ```
+
+
+## Disclaimer
+
+This project is developed and maintained independently as open-source software.
+It is not affiliated with any game developer, publisher, or official launcher.
+The software is intended exclusively for educational, research, archival, testing, and personal asset management purposes.
+
+
+## Credits
+
+- [7-Zip](https://www.7-zip.org)
+- [HDiffPatch (hpatchz)](https://github.com/sisong/HDiffPatch)
