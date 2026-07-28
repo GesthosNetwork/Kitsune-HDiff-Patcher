@@ -18,6 +18,8 @@ internal static class Verify
 
     public static bool Run()
     {
+        Program.SetTitle("Verifying files...");
+
         var failLogs = new List<string>();
         bool foundAny = false;
 
@@ -33,6 +35,9 @@ internal static class Verify
         if (!foundAny)
         {
             Logger.Warning("No pkg_version files found.");
+            Program.SetTitle("Verification skipped");
+            Logger.Success("Patching completed successfully.");
+
             return true;
         }
 
@@ -40,11 +45,18 @@ internal static class Verify
         {
             string logName = $"verify_result_{DateTime.Now:yyyyMMdd_HHmmss}.txt";
             File.WriteAllLines(logName, failLogs, new UTF8Encoding(false));
+
             Logger.Warning($"Fail report saved to: {logName}");
+            Logger.Warning("Verification failed.");
+            Program.SetTitle("Verification failed");
+
             return false;
         }
 
         Logger.Success("All files OK.");
+        Logger.Success("Patching completed successfully.");
+        Program.SetTitle("Completed successfully");
+
         return true;
     }
 
@@ -84,6 +96,7 @@ internal static class Verify
                 Logger.Warning(text);
                 failLogs.Add($"[{pkgFile}] {text}");
                 missing++;
+
                 continue;
             }
 
@@ -92,6 +105,7 @@ internal static class Verify
             if (actualSize != expectedSize)
             {
                 long diff = actualSize - expectedSize;
+
                 string text =
                     $"{index}/{total} [SIZE FAIL] {remoteName} | " +
                     $"expected={FormatSize(expectedSize)} " +
@@ -101,16 +115,19 @@ internal static class Verify
                 Logger.Warning(text);
                 failLogs.Add($"[{pkgFile}] {text}");
                 sizeMismatch++;
+
                 continue;
             }
 
             string actualMd5 = CalculateMd5(remoteName);
+
             if (!string.Equals(actualMd5, expectedMd5, StringComparison.OrdinalIgnoreCase))
             {
                 string text = $"{index}/{total} [MD5 FAIL] {remoteName} | {FormatSize(actualSize)}";
                 Logger.Warning(text);
                 failLogs.Add($"[{pkgFile}] {text}");
                 md5Mismatch++;
+
                 continue;
             }
 
@@ -133,7 +150,6 @@ internal static class Verify
     {
         using var md5 = MD5.Create();
         using var stream = File.OpenRead(filePath);
-
         byte[] hash = md5.ComputeHash(stream);
         return Convert.ToHexString(hash).ToLowerInvariant();
     }
@@ -147,6 +163,7 @@ internal static class Verify
     private static PkgEntry? ParseLine(string line)
     {
         line = line.Trim();
+
         if (string.IsNullOrWhiteSpace(line))
         {
             return null;
@@ -167,6 +184,7 @@ internal static class Verify
         try
         {
             int lastSpace = line.LastIndexOf(' ');
+
             if (lastSpace < 0)
             {
                 throw new FormatException();
@@ -176,6 +194,7 @@ internal static class Verify
             string rest = line[(lastSpace + 1)..].Trim();
 
             int pipeIndex = rest.IndexOf('|');
+
             if (pipeIndex < 0)
             {
                 throw new FormatException();
@@ -183,7 +202,6 @@ internal static class Verify
 
             string md5Part = rest[..pipeIndex].Trim();
             string sizePart = rest[(pipeIndex + 1)..].Trim();
-
             long size = long.Parse(sizePart, System.Globalization.CultureInfo.InvariantCulture);
 
             return new PkgEntry(pathPart, md5Part, size);
@@ -194,5 +212,9 @@ internal static class Verify
         }
     }
 
-    private sealed record PkgEntry(string RemoteName, string Md5, long FileSize);
+    private sealed record PkgEntry(
+        string RemoteName,
+        string Md5,
+        long FileSize
+    );
 }

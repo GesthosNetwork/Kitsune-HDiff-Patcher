@@ -1,6 +1,6 @@
 ## Kitsune HDiff Patcher
 
-A file update utility based on binary diff technology, featuring file verification and incremental patching.
+A lightweight file update tool powered by binary diff technology, featuring file verification and incremental patching.
 
 
 ## Compile Instructions
@@ -99,4 +99,4 @@ The software is intended exclusively for educational, research, archival, testin
 ## Credits
 
 - [7-Zip](https://www.7-zip.org)
-- [HDiffPatch (hpatchz)](https://github.com/sisong/HDiffPatch)
+- [HDiffPatch](https://github.com/sisong/HDiffPatch)

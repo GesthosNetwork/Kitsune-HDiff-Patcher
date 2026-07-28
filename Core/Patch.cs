@@ -252,7 +252,7 @@ internal static class Patch
                 File.SetAttributes(path, attrs & ~FileAttributes.ReadOnly);
             }
         }
-        catch { }
+        catch {}
     }
 
     private static void MakeWritableRecursive(string path)
@@ -276,10 +276,10 @@ internal static class Patch
                 {
                     EnsureWritable(item);
                 }
-                catch { }
+                catch {}
             }
         }
-        catch { }
+        catch {}
 
         EnsureWritable(path);
     }
@@ -392,7 +392,7 @@ internal static class Patch
             {
                 target = Path.GetFullPath(raw);
             }
-            catch { }
+            catch {}
 
             SetFileTitle("Deleting", target);
 
@@ -426,7 +426,7 @@ internal static class Patch
         {
             File.Delete(delete_txt);
         }
-        catch { }
+        catch {}
     }
 
     private static List<(FileInfo Source, FileInfo Patch, FileInfo Target)> ReadHdiffmapJson()
@@ -542,14 +542,14 @@ internal static class Patch
                 {
                     File.Delete(hdiff);
                 }
-                catch { }
+                catch {}
             }
 
             try
             {
                 File.Delete(hdifffiles_txt);
             }
-            catch { }
+            catch {}
         }
 
         foreach (var item in ReadHdiffmapJson())
@@ -620,7 +620,7 @@ internal static class Patch
             {
                 File.Delete(patch.FullName);
             }
-            catch { }
+            catch {}
         }
 
         try
@@ -630,7 +630,7 @@ internal static class Patch
                 File.Delete("hdiffmap.json");
             }
         }
-        catch { }
+        catch {}
 
         return patched;
     }
@@ -768,7 +768,7 @@ internal static class Patch
                     part.Delete();
                 }
             }
-            catch { }
+            catch {}
         }
 
         return ProcessLogicalArchive(logical, gameFolder);
@@ -821,7 +821,7 @@ internal static class Patch
                 archive.Delete();
             }
         }
-        catch { }
+        catch {}
     }
 
     private static (string? From, string? To) ParseFromToVersionsFromName(string name)
@@ -899,14 +899,14 @@ internal static class Patch
                     File.Copy(file, destination, true);
                 }
             }
-            catch { }
+            catch {}
         }
 
         try
         {
             Directory.Delete(oldPath, true);
         }
-        catch { }
+        catch {}
 
         Logger.Success("Audio migration completed.");
         return true;
@@ -1011,7 +1011,7 @@ internal static class Patch
                         removed = true;
                     }
                 }
-                catch { }
+                catch {}
             }
 
             if (!removed)
@@ -1047,7 +1047,7 @@ internal static class Patch
                         removed = true;
                     }
                 }
-                catch { }
+                catch {}
             }
 
             if (!removed)
@@ -1070,8 +1070,7 @@ internal static class Patch
             "channel=1",
             "cps=hoyoverse",
             $"game_version={GAME_VERSION}",
-            "sub_channel=0",
-            ""
+            "sub_channel=0"
         ];
 
         File.WriteAllLines("config.ini", content, new UTF8Encoding(false));
@@ -1120,10 +1119,10 @@ internal static class Patch
 
                         info.Delete();
                     }
-                    catch { }
+                    catch {}
                 }
             }
-            catch { }
+            catch {}
         }
 
         string[] targets =
@@ -1192,7 +1191,7 @@ internal static class Patch
                     }
                 }
             }
-            catch { }
+            catch {}
         }
 
         string bin_ver = Path.Combine(gameFolder.FullName, "StreamingAssets", "BinaryVersion.bytes");
@@ -1218,7 +1217,7 @@ internal static class Patch
                         return NormalizeVersion(match.Groups[1].Value);
                     }
                 }
-                catch { }
+                catch {}
             }
         }
 
@@ -1245,7 +1244,7 @@ internal static class Patch
                         return NormalizeVersion(match.Groups[1].Value);
                     }
                 }
-                catch { }
+                catch {}
             }
         }
 

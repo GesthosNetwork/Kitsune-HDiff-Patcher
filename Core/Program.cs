@@ -17,13 +17,8 @@ internal static class Program
         {
             bool verifyOk = Verify.Run();
 
-            if (verifyOk)
+            if (!verifyOk)
             {
-                Logger.Success("Patching completed successfully.");
-            }
-            else
-            {
-                Logger.Warning("Patching completed successfully, but verification failed.");
                 result = 1;
             }
         }
@@ -32,8 +27,7 @@ internal static class Program
             Logger.Error("Patching failed.");
         }
 
-        Console.WriteLine();
-        Console.Write("Press any key to exit...");
+        Console.Write("\nPress any key to exit...");
         Console.ReadKey(true);
 
         return result;
