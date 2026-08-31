@@ -5,7 +5,7 @@ A lightweight file update tool powered by binary diff technology, featuring file
 
 ## Compile Instructions
 
-1. Install [.NET 10.0 SDK](https://dotnet.microsoft.com/download/dotnet/10.0)  
+1. Install [.NET 11.0 SDK](https://dotnet.microsoft.com/download/dotnet/11.0)  
 2. Run `Compile.bat`  
 3. Output will be in `bin` folder.
 

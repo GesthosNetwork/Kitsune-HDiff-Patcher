@@ -3,18 +3,20 @@
   <PropertyGroup>
     <AssemblyName>Kitsune</AssemblyName>
     <OutputType>Exe</OutputType>
-    <TargetFramework>net10.0</TargetFramework>
+    <ApplicationIcon>Core\app.ico</ApplicationIcon>
+    <TargetFramework>net11.0</TargetFramework>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
-    <Version>1.0.1</Version>
-	<Copyright>GesthosNetwork © 2026 All rights reserved.</Copyright>
+    <SelfContained>true</SelfContained>
+    <Version>1.0.2</Version>
+    <CurrentYear>$([System.DateTime]::Now.Year)</CurrentYear>
+    <Copyright>Copyright © $(CurrentYear) GesthosNetwork</Copyright>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <PublishSingleFile>true</PublishSingleFile>
-    <SelfContained>true</SelfContained>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
     <PublishTrimmed>false</PublishTrimmed>
     <InvariantGlobalization>true</InvariantGlobalization>
     <PublishDir>.\bin\</PublishDir>
-    <ApplicationIcon>Core\app.ico</ApplicationIcon>
   </PropertyGroup>
 
   <ItemGroup>

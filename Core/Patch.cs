@@ -11,11 +11,13 @@ internal static class Patch
     private static readonly string[] GAME_FOLDERS =
     [
         "GenshinImpact_Data",
+        "Genshin_Data",
         "YuanShen_Data",
         "StarRail_Data",
         "ZenlessZoneZero_Data",
         "ZenlessZoneZeroBeta_Data",
         "BH3_Data",
+        "NexusAnima_Data",
         "Client"
     ];
 
@@ -33,9 +35,7 @@ internal static class Patch
     ];
 
     private static readonly HashSet<string> EXCLUDE_FILES_LOWER =
-        EXCLUDE_FILES
-            .Select(NormalizeText)
-            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        EXCLUDE_FILES.Select(NormalizeText).ToHashSet(StringComparer.OrdinalIgnoreCase);
 
     private static readonly Regex VERSION_REGEX =
         new(@"(\d+\.\d+(?:\.\d+)?)", RegexOptions.Compiled);
@@ -127,17 +127,20 @@ internal static class Patch
                     Program.SetTitle("Writing configuration...");
                     WriteConfigIni();
                 }
+            }
 
-                Program.SetTitle("Cleaning temporary files...");
-                CleanupAuxFiles(gameFolder);
+            Logger.Info("Patching finished.");
+
+            Program.SetTitle("Cleaning temporary files...");
+            if (!CleanupAuxFiles(gameFolder))
+            {
+                throw new IOException("Cleanup did not complete successfully; verification was not started.");
             }
 
             Program.SetTitle("Removing empty directories...");
             CleanupEmptyDirs(gameFolder);
             CleanupEmptyDirsRoot();
 
-            Program.SetTitle("Verifying files...");
-            Logger.Info("Patching finished.");
             return 0;
         }
         catch (Exception ex)
@@ -151,9 +154,7 @@ internal static class Patch
     private static string NormalizeText(string value)
     {
         return value
-            .Replace('\\', '/')
-            .ToLowerInvariant()
-            .TrimStart('.', '/');
+            .Replace('\\', '/').ToLowerInvariant().TrimStart('.', '/');
     }
 
     private static string NormalizeVersion(string v)
@@ -321,9 +322,7 @@ internal static class Patch
         }
 
         string text = File.ReadAllText(filepath, Encoding.UTF8);
-        text = text.Replace("{\"remoteName\": \"", "")
-                   .Replace("\"}", "")
-                   .Replace("/", "\\");
+        text = text.Replace("{\"remoteName\": \"", "").Replace("\"}", "").Replace("/", "\\");
         File.WriteAllText(filepath, text, new UTF8Encoding(false));
     }
 
@@ -1076,101 +1075,205 @@ internal static class Patch
         File.WriteAllLines("config.ini", content, new UTF8Encoding(false));
     }
 
-    private static void CleanupAuxFiles(DirectoryInfo gameFolder)
+    private static bool CleanupAuxFiles(DirectoryInfo gameFolder)
     {
-        Program.SetTitle("Cleaning temporary files...");
+        string root = Directory.GetCurrentDirectory();
+        bool success = true;
 
-        string[] patterns =
+        string[] exactFiles =
         [
-            "*.py", "*.bat", "*.zip", "*.zip.*", "*.zip.001", "*.zip.002", "*.rar", "*.rar.*",
-            "*.rar.001", "*.rar.002", "*.part1.rar", "*.part2.rar", "*.part*.rar", "*.7z", "*.7z.*",
-            "*.7z.001", "*.7z.002", "hpatchz.exe", "hdiffz.exe", "7z.exe", "version.dll", "*.temp",
-            "*.tmp", "*.dmp", "*.bak", "*.txt", "*.log", "*.md"
+            "deletefiles.txt",
+            "hdifffiles.txt",
+            "hdiffmap.json"
         ];
 
-        string root = Directory.GetCurrentDirectory();
-
-        foreach (var pattern in patterns)
+        foreach (string fileName in exactFiles)
         {
-            try
+            string path = Path.Combine(root, fileName);
+            if (!File.Exists(path))
             {
-                foreach (var file in Directory.EnumerateFiles(root, pattern, SearchOption.AllDirectories))
+                continue;
+            }
+
+            if (!TryDeleteFile(path, "cleanup artifact"))
+            {
+                success = false;
+            }
+        }
+
+        foreach (string file in Directory.EnumerateFiles(root, "*.hdiff", SearchOption.AllDirectories))
+        {
+            if (!TryDeleteFile(file, "hdiff artifact"))
+            {
+                success = false;
+            }
+        }
+
+        string[] archivePatterns = [ "*.zip", "*.zip.*", "*.rar", "*.rar.*", "*.7z", "*.7z.*" ];
+
+        foreach (string pattern in archivePatterns)
+        {
+            foreach (string file in Directory.EnumerateFiles(root, pattern, SearchOption.TopDirectoryOnly))
+            {
+                var info = new FileInfo(file);
+                if (IsExcluded(info))
                 {
-                    try
-                    {
-                        var info = new FileInfo(file);
+                    continue;
+                }
 
-                        SetFileTitle("Cleaning", info.Name);
-
-                        string normalized = NormalizePathText(info.FullName);
-
-                        if (deleteList.Contains(normalized))
-                        {
-                            MakeWritableRecursive(info.FullName);
-                            info.Delete();
-                            Logger.Info($"Deleted from deletefiles.txt: {info.FullName}");
-                            continue;
-                        }
-
-                        if (IsExcluded(info))
-                        {
-                            continue;
-                        }
-
-                        info.Delete();
-                    }
-                    catch {}
+                if (!TryDeleteFile(file, "archive artifact"))
+                {
+                    success = false;
                 }
             }
-            catch {}
+        }
+
+        string[] rootTempPatterns = [ "*.tmp", "*.temp", "*.dmp", "*.bak" ];
+
+        foreach (string pattern in rootTempPatterns)
+        {
+            foreach (string file in Directory.EnumerateFiles(root, pattern, SearchOption.TopDirectoryOnly))
+            {
+                var info = new FileInfo(file);
+                if (IsExcluded(info))
+                {
+                    continue;
+                }
+
+                if (!TryDeleteFile(file, "temporary artifact"))
+                {
+                    success = false;
+                }
+            }
         }
 
         string[] targets =
         [
             "Logs", "Log", "SDKCaches", "webCaches", "blob_storage", "ldiff", "launcherDownload", "kr_game_cache",
-            "Rp", ".quality", "quality", "CrashSightLog", "pipe_client", "TQM64", "wesight"
+            "Rp", "Links", ".quality", "quality", "CrashSightLog", "pipe_client", "TQM64", "wesight"
         ];
 
-        foreach (var dir in Directory.GetDirectories(root))
+        foreach (string dir in Directory.GetDirectories(root))
         {
-            string name = Path.GetFileName(dir);
-            if (!targets.Contains(name, StringComparer.OrdinalIgnoreCase))
+            if (!targets.Contains(Path.GetFileName(dir), StringComparer.OrdinalIgnoreCase))
             {
                 continue;
             }
 
-            try
+            if (!TryDeleteDirectory(dir, "root cleanup directory"))
             {
-                SetFileTitle("Deleting directory", name);
-                MakeWritableRecursive(dir);
-                Directory.Delete(dir, true);
-                Logger.Info($"Deleted directory tree (root): {dir}");
-            }
-            catch (Exception ex)
-            {
-                Logger.Warning($"Failed to delete {dir}: {ex.Message}");
+                success = false;
             }
         }
 
-        foreach (var dir in Directory.GetDirectories(gameFolder.FullName, "*", SearchOption.AllDirectories))
+        foreach (string dir in Directory.GetDirectories(gameFolder.FullName, "*", SearchOption.AllDirectories))
         {
-            string name = Path.GetFileName(dir);
-            if (!targets.Contains(name, StringComparer.OrdinalIgnoreCase))
+            if (!targets.Contains(Path.GetFileName(dir), StringComparer.OrdinalIgnoreCase))
             {
                 continue;
             }
 
-            try
+            if (!TryDeleteDirectory(dir, "game cleanup directory"))
             {
-                SetFileTitle("Deleting directory", name);
-                MakeWritableRecursive(dir);
-                Directory.Delete(dir, true);
-                Logger.Info($"Deleted directory tree (game folder): {dir}");
+                success = false;
             }
-            catch (Exception ex)
+        }
+
+        foreach (string fileName in exactFiles)
+        {
+            string path = Path.Combine(root, fileName);
+            if (File.Exists(path))
             {
-                Logger.Warning($"Failed to delete {dir}: {ex.Message}");
+                Logger.Error($"Cleanup incomplete: {path}");
+                success = false;
             }
+        }
+
+        if (Directory.EnumerateFiles(root, "*.hdiff", SearchOption.AllDirectories).Any())
+        {
+            Logger.Error("Cleanup incomplete: one or more .hdiff files remain.");
+            success = false;
+        }
+
+        foreach (string pattern in archivePatterns)
+        {
+            foreach (string file in Directory.EnumerateFiles(root, pattern, SearchOption.TopDirectoryOnly))
+            {
+                if (!IsExcluded(new FileInfo(file)))
+                {
+                    Logger.Error($"Cleanup incomplete: archive artifact remains: {file}");
+                    success = false;
+                }
+            }
+        }
+
+        foreach (string dir in Directory.EnumerateDirectories(root, "*", SearchOption.AllDirectories))
+        {
+            if (targets.Contains(Path.GetFileName(dir), StringComparer.OrdinalIgnoreCase))
+            {
+                Logger.Error($"Cleanup incomplete: cleanup directory remains: {dir}");
+                success = false;
+            }
+        }
+
+        return success;
+    }
+
+    private static bool TryDeleteFile(string path, string reason)
+    {
+        try
+        {
+            if (!File.Exists(path))
+            {
+                return true;
+            }
+
+            EnsureWritable(path);
+            SetFileTitle("Cleaning", Path.GetFileName(path));
+            File.Delete(path);
+
+            if (File.Exists(path))
+            {
+                Logger.Error($"Failed to delete {reason}: {path}");
+                return false;
+            }
+
+            Logger.Info($"Deleted {reason}: {path}");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Logger.Error($"Failed to delete {reason} {path}: {ex.Message}");
+            return false;
+        }
+    }
+
+    private static bool TryDeleteDirectory(string path, string reason)
+    {
+        try
+        {
+            if (!Directory.Exists(path))
+            {
+                return true;
+            }
+
+            SetFileTitle("Deleting directory", Path.GetFileName(path));
+            MakeWritableRecursive(path);
+            Directory.Delete(path, true);
+
+            if (Directory.Exists(path))
+            {
+                Logger.Error($"Failed to delete {reason}: {path}");
+                return false;
+            }
+
+            Logger.Info($"Deleted {reason}: {path}");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Logger.Error($"Failed to delete {reason} {path}: {ex.Message}");
+            return false;
         }
     }
 
