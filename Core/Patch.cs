@@ -478,9 +478,16 @@ internal static class Patch
     private static bool ApplyHDiff()
     {
         bool patched = false;
+        bool hasHdiffFiles = File.Exists("hdifffiles.txt");
+        bool hasHdiffMap = File.Exists("hdiffmap.json");
+
+        if (!hasHdiffFiles && !hasHdiffMap)
+        {
+            return ApplyHDiffWithoutMapping();
+        }
 
         string hdifffiles_txt = "hdifffiles.txt";
-        if (File.Exists(hdifffiles_txt))
+        if (hasHdiffFiles)
         {
             ReplaceTextInFile(hdifffiles_txt);
 
@@ -551,40 +558,123 @@ internal static class Patch
             catch {}
         }
 
-        foreach (var item in ReadHdiffmapJson())
+        if (hasHdiffMap)
         {
-            var source = item.Source;
-            var patch = item.Patch;
-            var target = item.Target;
-
-            if (!source.Exists)
+            foreach (var item in ReadHdiffmapJson())
             {
-                Logger.Warning($"Source file not found: {source.FullName}");
+                var source = item.Source;
+                var patch = item.Patch;
+                var target = item.Target;
+
+                if (!source.Exists)
+                {
+                    Logger.Warning($"Source file not found: {source.FullName}");
+                    continue;
+                }
+
+                if (!patch.Exists)
+                {
+                    Logger.Warning($"Patch file not found: {patch.FullName}");
+                    continue;
+                }
+
+                if (target.Directory != null)
+                {
+                    target.Directory.Create();
+                }
+
+                EnsureWritable(source.FullName);
+
+                try
+                {
+                    Program.SetTitle($"Patching {ShortTitleText(target.Name)}");
+
+                    int code = RunProcess(
+                        HPATCHZ_PATH ?? throw new InvalidOperationException("hpatchz.exe not loaded."),
+                        new[]
+                        {
+                            "-f", source.FullName, patch.FullName, target.FullName
+                        });
+
+                    if (code != 0)
+                    {
+                        throw new Exception($"hpatchz exit code {code}");
+                    }
+
+                    patched = true;
+                    Logger.Info($"Patched (map): {source.FullName} -> {target.FullName}");
+
+                    if (!source.FullName.Equals(target.FullName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        try
+                        {
+                            EnsureWritable(source.FullName);
+                            File.Delete(source.FullName);
+                            Logger.Info($"Deleted old source file: {source.FullName}");
+                        }
+                        catch (Exception ex)
+                        {
+                            Logger.Warning($"Failed to delete old source file {source.FullName}: {ex.Message}");
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Logger.Error($"hpatchz failed for {source.FullName}: {ex.Message}");
+                    throw;
+                }
+
+                try
+                {
+                    File.Delete(patch.FullName);
+                }
+                catch {}
+            }
+        }
+
+        try
+        {
+            if (hasHdiffMap && File.Exists("hdiffmap.json"))
+            {
+                File.Delete("hdiffmap.json");
+            }
+        }
+        catch {}
+
+        return patched;
+    }
+
+    private static bool ApplyHDiffWithoutMapping()
+    {
+        bool patched = false;
+        string root = Directory.GetCurrentDirectory();
+        var hdiffFiles = Directory
+            .EnumerateFiles(root, "*", SearchOption.AllDirectories)
+            .Where(x => x.EndsWith(".hdiff", StringComparison.OrdinalIgnoreCase))
+            .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        foreach (string hdiff in hdiffFiles)
+        {
+            string source = hdiff[..^".hdiff".Length];
+
+            if (!File.Exists(source))
+            {
+                Logger.Warning($"Source file not found: {source}");
                 continue;
             }
 
-            if (!patch.Exists)
-            {
-                Logger.Warning($"Patch file not found: {patch.FullName}");
-                continue;
-            }
-
-            if (target.Directory != null)
-            {
-                target.Directory.Create();
-            }
-
-            EnsureWritable(source.FullName);
+            EnsureWritable(source);
 
             try
             {
-                Program.SetTitle($"Patching {ShortTitleText(target.Name)}");
+                Program.SetTitle($"Patching {ShortTitleText(Path.GetFileName(source))}");
 
                 int code = RunProcess(
                     HPATCHZ_PATH ?? throw new InvalidOperationException("hpatchz.exe not loaded."),
                     new[]
                     {
-                        "-f", source.FullName, patch.FullName, target.FullName
+                        "-f", Path.GetFullPath(source), Path.GetFullPath(hdiff), Path.GetFullPath(source)
                     });
 
                 if (code != 0)
@@ -593,43 +683,20 @@ internal static class Patch
                 }
 
                 patched = true;
-                Logger.Info($"Patched (map): {source.FullName} -> {target.FullName}");
-
-                if (!source.FullName.Equals(target.FullName, StringComparison.OrdinalIgnoreCase))
-                {
-                    try
-                    {
-                        EnsureWritable(source.FullName);
-                        File.Delete(source.FullName);
-                        Logger.Info($"Deleted old source file: {source.FullName}");
-                    }
-                    catch (Exception ex)
-                    {
-                        Logger.Warning($"Failed to delete old source file {source.FullName}: {ex.Message}");
-                    }
-                }
+                Logger.Info($"Patched (adjacent): {source}");
             }
             catch (Exception ex)
             {
-                Logger.Error($"hpatchz failed for {source.FullName}: {ex.Message}");
+                Logger.Error($"hpatchz failed for {source}: {ex.Message}");
                 throw;
             }
 
             try
             {
-                File.Delete(patch.FullName);
+                File.Delete(hdiff);
             }
             catch {}
         }
-
-        try
-        {
-            if (File.Exists("hdiffmap.json"))
-            {
-                File.Delete("hdiffmap.json");
-            }
-        }
-        catch {}
 
         return patched;
     }
@@ -1067,7 +1134,7 @@ internal static class Patch
         [
             "[General]",
             "channel=1",
-            "cps=hoyoverse",
+            "cps=",
             $"game_version={GAME_VERSION}",
             "sub_channel=0"
         ];
@@ -1128,7 +1195,7 @@ internal static class Patch
             }
         }
 
-        string[] rootTempPatterns = [ "*.tmp", "*.temp", "*.dmp", "*.bak" ];
+        string[] rootTempPatterns = [ "*.tmp", "*.temp", "*.dmp", "*.bak", "*.aria2__temp" ];
 
         foreach (string pattern in rootTempPatterns)
         {

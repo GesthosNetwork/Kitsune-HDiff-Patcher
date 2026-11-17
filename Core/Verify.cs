@@ -17,6 +17,8 @@ internal static class Verify
         "Audio_Chinese_pkg_version"
     ];
 
+    private const string UnlistedFilesDirectoryName = "unlisted_files";
+
     private static readonly HashSet<string> NonGameFiles =
         new(StringComparer.OrdinalIgnoreCase)
         {
@@ -67,16 +69,15 @@ internal static class Verify
             md5Fail += stats.Md5Fail;
         }
 
-        List<string> extraFiles = FindExtraFiles(expectedFiles);
+        List<string> unlistedFiles = FindUnlistedFiles(expectedFiles);
         string? reportName = null;
 
-        if (failures.Count > 0 || extraFiles.Count > 0)
+        if (failures.Count > 0 || unlistedFiles.Count > 0)
         {
             reportName = $"verify_result_{DateTime.Now:yyyyMMdd_HHmmss}.txt";
 
             File.WriteAllLines(
-                reportName, BuildReport(
-                    manifests, failures, extraFiles, total, ok, missing, sizeFail, md5Fail, expectedFiles.Count),
+                reportName, BuildReport(manifests, failures, unlistedFiles, total, ok, missing, sizeFail, md5Fail, expectedFiles.Count),
                 new UTF8Encoding(false));
 
             Logger.Info($"Verify report saved to: {reportName}");
@@ -86,9 +87,9 @@ internal static class Verify
         {
             Program.SetTitle("Verification failed");
         }
-        else if (extraFiles.Count > 0)
+        else if (unlistedFiles.Count > 0)
         {
-            Program.SetTitle("Completed with extra files");
+            Program.SetTitle("Completed with unlisted files");
         }
         else
         {
@@ -101,9 +102,11 @@ internal static class Verify
         Logger.Info($"MISSING       : {missing}");
         Logger.Info($"SIZE FAIL     : {sizeFail}");
         Logger.Info($"MD5 FAIL      : {md5Fail}");
-        Logger.Info($"EXTRA         : {extraFiles.Count}");
+        Logger.Info($"UNLISTED      : {unlistedFiles.Count}");
 
-        return failures.Count == 0;
+        bool unlistedMoveOk = MoveUnlistedFiles(unlistedFiles);
+
+        return failures.Count == 0 && unlistedMoveOk;
     }
 
     private static void LoadExpectedFiles(string manifest, HashSet<string> expectedFiles)
@@ -121,10 +124,10 @@ internal static class Verify
         }
     }
 
-    private static List<string> FindExtraFiles(HashSet<string> expectedFiles)
+    private static List<string> FindUnlistedFiles(HashSet<string> expectedFiles)
     {
         string root = Path.GetFullPath(Directory.GetCurrentDirectory());
-        var extraFiles = new List<string>();
+        var unlistedFiles = new List<string>();
 
         foreach (string file in Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories))
         {
@@ -134,25 +137,107 @@ internal static class Verify
             {
                 relativePath = Path.GetRelativePath(root, file);
             }
-            catch { continue; }
+            catch
+            {
+                continue;
+            }
 
-            if (IsIgnoredExtraFile(relativePath))
+            if (IsIgnoredUnlistedFile(relativePath))
                 continue;
 
             string normalized = NormalizePath(relativePath);
 
             if (!expectedFiles.Contains(normalized))
-                extraFiles.Add(normalized);
+                unlistedFiles.Add(normalized);
         }
 
-        extraFiles.Sort(StringComparer.OrdinalIgnoreCase);
-        return extraFiles;
+        unlistedFiles.Sort(StringComparer.OrdinalIgnoreCase);
+        return unlistedFiles;
     }
 
-    private static bool IsIgnoredExtraFile(string relativePath)
+    private static bool IsUnlistedFilesPath(string normalizedPath)
+    {
+        return normalizedPath.Equals(UnlistedFilesDirectoryName, StringComparison.OrdinalIgnoreCase) ||
+               normalizedPath.StartsWith(UnlistedFilesDirectoryName + "/", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool MoveUnlistedFiles(List<string> unlistedFiles)
+    {
+        if (unlistedFiles.Count == 0)
+            return true;
+
+        string root = Path.GetFullPath(Directory.GetCurrentDirectory());
+        string destinationRoot = Path.Combine(root, UnlistedFilesDirectoryName);
+        bool success = true;
+
+        try
+        {
+            Directory.CreateDirectory(destinationRoot);
+        }
+        catch (Exception ex)
+        {
+            Logger.Error($"Failed to create {UnlistedFilesDirectoryName} directory: {ex.Message}");
+            return false;
+        }
+
+        Logger.Info($"Moving {unlistedFiles.Count} unlisted file(s) to {UnlistedFilesDirectoryName}...");
+
+        foreach (string relativePath in unlistedFiles)
+        {
+            string relativeOsPath = relativePath.Replace('/', Path.DirectorySeparatorChar);
+            string source = Path.GetFullPath(Path.Combine(root, relativeOsPath));
+            string destination = Path.Combine(destinationRoot, relativeOsPath);
+
+            try
+            {
+                if (!File.Exists(source))
+                {
+                    Logger.Warning($"Unlisted file no longer exists: {relativePath}");
+                    success = false;
+                    continue;
+                }
+
+                string? destinationDirectory = Path.GetDirectoryName(destination);
+                if (!string.IsNullOrEmpty(destinationDirectory))
+                {
+                    Directory.CreateDirectory(destinationDirectory);
+                }
+
+                EnsureWritableFile(source);
+                if (File.Exists(destination))
+                {
+                    EnsureWritableFile(destination);
+                }
+
+                File.Move(source, destination, true);
+                Logger.Info($"Moved unlisted file: {relativePath} -> {UnlistedFilesDirectoryName}/{relativePath}");
+            }
+            catch (Exception ex)
+            {
+                Logger.Error($"Failed to move unlisted file {relativePath}: {ex.Message}");
+                success = false;
+            }
+        }
+
+        if (success)
+        {
+            Logger.Info("Unlisted files moved successfully.");
+        }
+        else
+        {
+            Logger.Warning("One or more unlisted files could not be moved.");
+        }
+
+        return success;
+    }
+
+    private static bool IsIgnoredUnlistedFile(string relativePath)
     {
         string normalized = NormalizePath(relativePath);
         string fileName = Path.GetFileName(relativePath);
+
+        if (IsUnlistedFilesPath(normalized))
+            return true;
 
         if (NonGameFiles.Contains(normalized))
             return true;
@@ -223,7 +308,7 @@ internal static class Verify
     }
 
     private static List<string> BuildReport(
-        List<string> manifests, List<string> failures, List<string> extraFiles,
+        List<string> manifests, List<string> failures, List<string> unlistedFiles,
         int total, int ok, int missing, int sizeFail, int md5Fail, int expectedFileCount)
     {
         var report = new List<string>
@@ -247,16 +332,16 @@ internal static class Verify
         report.Add($"MISSING       : {missing}");
         report.Add($"SIZE FAIL     : {sizeFail}");
         report.Add($"MD5 FAIL      : {md5Fail}");
-        report.Add($"EXTRA         : {extraFiles.Count}");
+        report.Add($"UNLISTED      : {unlistedFiles.Count}");
         report.Add($"Expected files: {expectedFileCount}");
         report.Add("");
 
-        if (extraFiles.Count > 0)
+        if (unlistedFiles.Count > 0)
         {
-            report.Add("---------- EXTRA FILES ----------");
+            report.Add("---------- UNLISTED FILES ----------");
 
-            foreach (string file in extraFiles)
-                report.Add($"[EXTRA] {file}");
+            foreach (string file in unlistedFiles)
+                report.Add($"[UNLISTED] {file}");
 
             report.Add("");
         }
@@ -352,6 +437,19 @@ internal static class Verify
         return new VerifyStats(total, ok, missing, sizeFail, md5Fail);
     }
 
+    private static void EnsureWritableFile(string path)
+    {
+        try
+        {
+            FileAttributes attrs = File.GetAttributes(path);
+            if ((attrs & FileAttributes.ReadOnly) != 0)
+            {
+                File.SetAttributes(path, attrs & ~FileAttributes.ReadOnly);
+            }
+        }
+        catch {}
+    }
+
     private static string CalculateMd5(string filePath)
     {
         using var md5 = MD5.Create();
@@ -383,12 +481,9 @@ internal static class Verify
             JsonElement root = doc.RootElement;
 
             return new PkgEntry(
-                root.GetProperty("remoteName")
-                    .GetString() ?? string.Empty,
-                root.GetProperty("md5")
-                    .GetString() ?? string.Empty,
-                root.GetProperty("fileSize")
-                    .GetInt64());
+                root.GetProperty("remoteName").GetString() ?? string.Empty,
+                root.GetProperty("md5").GetString() ?? string.Empty,
+                root.GetProperty("fileSize").GetInt64());
         }
 
         int lastSpace = line.LastIndexOf(' ');
