@@ -7,23 +7,12 @@ namespace Patcher;
 
 internal static class Verify
 {
-    private static readonly string[] PkgFiles =
-    [
-        "pkg_version",
-        "beyond_pkg_version",
-        "Audio_English(US)_pkg_version",
-        "Audio_Japanese_pkg_version",
-        "Audio_Korean_pkg_version",
-        "Audio_Chinese_pkg_version"
-    ];
-
-    private const string UnlistedFilesDirectoryName = "unlisted_files";
+    private const string UnlistedFilesDirectoryName = "Unlisted_Files";
 
     private static readonly HashSet<string> NonGameFiles =
         new(StringComparer.OrdinalIgnoreCase)
         {
             "config.ini",
-            "Kitsune.exe",
             "LICENSE.txt",
             "vulkan_gpu_list_config.txt",
             "ThirdPartyNotices.txt",
@@ -35,23 +24,69 @@ internal static class Verify
             "BeyondAssets/BeyondAssistEditor/Resource/Font/README.md"
         };
 
-    public static bool Run()
+    public static bool Run(bool hasAppliedPatches, IReadOnlyList<string> processedArchives)
+    {
+        if (!hasAppliedPatches && processedArchives.Count == 0)
+        {
+            return true;
+        }
+
+        List<string> manifests = DiscoverManifests();
+
+        if (manifests.Count == 0)
+        {
+            Program.SetTitle("Verification skipped");
+            Logger.Warning("No matching package manifest found; verification skipped.");
+            return true;
+        }
+
+        return RunManifests(manifests);
+    }
+
+    public static bool HasSupportedManifests()
+    {
+        return DiscoverManifests().Count > 0;
+    }
+
+    public static bool RunAll()
+    {
+        List<string> manifests = DiscoverManifests();
+
+        if (manifests.Count == 0)
+        {
+            Program.SetTitle("Verification failed");
+            Logger.Error("No supported package manifests found in the current directory.");
+            return false;
+        }
+
+        return RunManifests(manifests);
+    }
+
+    private static bool RunManifests(List<string> manifests)
     {
         Program.SetTitle("Verifying files...");
 
         var failures = new List<string>();
         var expectedFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var manifests = PkgFiles.Where(File.Exists).ToList();
-
-        if (manifests.Count == 0)
-        {
-            Logger.Warning("No pkg_version files found.");
-            Program.SetTitle("Verification skipped");
-            return true;
-        }
+        var allExistingManifests = DiscoverManifests().ToHashSet(StringComparer.OrdinalIgnoreCase);
+        bool fullManifestCoverage = allExistingManifests.Count > 0 && allExistingManifests.SetEquals(manifests);
+        var manifestEntries = new Dictionary<string, List<PkgEntry>>(StringComparer.OrdinalIgnoreCase);
 
         foreach (string manifest in manifests)
-            LoadExpectedFiles(manifest, expectedFiles);
+        {
+            List<PkgEntry> entries = ReadEntries(manifest);
+            manifestEntries[manifest] = entries;
+
+            foreach (PkgEntry entry in entries)
+            {
+                if (!string.IsNullOrWhiteSpace(entry.RemoteName))
+                {
+                    expectedFiles.Add(NormalizePath(entry.RemoteName));
+                }
+            }
+        }
+
+        Logger.Info($"Found {manifests.Count} package manifest(s).");
 
         int total = 0;
         int ok = 0;
@@ -61,7 +96,8 @@ internal static class Verify
 
         foreach (string manifest in manifests)
         {
-            VerifyStats stats = VerifyFile(manifest, failures);
+            Logger.Info($"Processing {Path.GetFileName(manifest)} ...");
+            VerifyStats stats = VerifyFile(manifest, manifestEntries[manifest], failures);
             total += stats.Total;
             ok += stats.Ok;
             missing += stats.Missing;
@@ -69,59 +105,103 @@ internal static class Verify
             md5Fail += stats.Md5Fail;
         }
 
-        List<string> unlistedFiles = FindUnlistedFiles(expectedFiles);
-        string? reportName = null;
-
+        List<string> unlistedFiles = fullManifestCoverage
+            ? FindUnlistedFiles(expectedFiles)
+            : new List<string>();
         if (failures.Count > 0 || unlistedFiles.Count > 0)
         {
-            reportName = $"verify_result_{DateTime.Now:yyyyMMdd_HHmmss}.txt";
+            string reportName = $"verify_result_{DateTime.Now:yyyyMMdd_HHmmss}.txt";
 
             File.WriteAllLines(
                 reportName, BuildReport(manifests, failures, unlistedFiles, total, ok, missing, sizeFail, md5Fail, expectedFiles.Count),
                 new UTF8Encoding(false));
 
-            Logger.Info($"Verify report saved to: {reportName}");
+            Logger.Info($"Verification report saved: {reportName}");
+        }
+
+        string unlistedSummary = fullManifestCoverage
+            ? unlistedFiles.Count.ToString("N0", System.Globalization.CultureInfo.InvariantCulture)
+            : "N/A";
+        Logger.Info(
+            $"Verification completed. Checked: {total:N0}; Passed: {ok:N0}; Missing: {missing:N0}; " +
+            $"Size mismatch: {sizeFail:N0}; MD5 mismatch: {md5Fail:N0}; Unlisted: {unlistedSummary}.\n");
+
+        bool unlistedMoveOk = fullManifestCoverage
+            ? MoveUnlistedFiles(unlistedFiles)
+            : true;
+        bool fullyVerified = total > 0 &&
+            ok == total &&
+            missing == 0 &&
+            sizeFail == 0 &&
+            md5Fail == 0 &&
+            failures.Count == 0;
+        bool unlistedCleanupOk = true;
+
+        if (fullyVerified && unlistedMoveOk)
+        {
+            unlistedCleanupOk = DeleteUnlistedFilesDirectory();
         }
 
         if (failures.Count > 0)
         {
             Program.SetTitle("Verification failed");
         }
-        else if (unlistedFiles.Count > 0)
+        else if (!unlistedMoveOk || !unlistedCleanupOk)
         {
-            Program.SetTitle("Completed with unlisted files");
+            Program.SetTitle("Verification cleanup failed");
         }
         else
         {
             Program.SetTitle("Completed successfully");
         }
 
-        Logger.Info("---------- SUMMARY ----------");
-        Logger.Info($"Total         : {total}");
-        Logger.Info($"OK            : {ok}");
-        Logger.Info($"MISSING       : {missing}");
-        Logger.Info($"SIZE FAIL     : {sizeFail}");
-        Logger.Info($"MD5 FAIL      : {md5Fail}");
-        Logger.Info($"UNLISTED      : {unlistedFiles.Count}");
-
-        bool unlistedMoveOk = MoveUnlistedFiles(unlistedFiles);
-
-        return failures.Count == 0 && unlistedMoveOk;
+        return failures.Count == 0 && unlistedMoveOk && unlistedCleanupOk;
     }
 
-    private static void LoadExpectedFiles(string manifest, HashSet<string> expectedFiles)
+    private static List<string> DiscoverManifests()
     {
+        string root = Directory.GetCurrentDirectory();
+        var manifests = new List<string>();
+
+        string defaultManifest = Path.Combine(root, "pkg_version");
+        if (File.Exists(defaultManifest))
+        {
+            manifests.Add(defaultManifest);
+        }
+
+        manifests.AddRange(
+            Directory.EnumerateFiles(root, "*_pkg_version", SearchOption.TopDirectoryOnly)
+                .Where(IsValidManifestCandidate));
+
+        return manifests
+            .Select(Path.GetFullPath)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(manifest => Path.GetFileName(manifest).Equals("pkg_version", StringComparison.OrdinalIgnoreCase) ? 0 : 1)
+            .ThenBy(manifest => Path.GetFileName(manifest), StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    private static bool IsValidManifestCandidate(string path)
+    {
+        string fileName = Path.GetFileName(path);
+        return fileName.EndsWith("_pkg_version", StringComparison.OrdinalIgnoreCase) &&
+            fileName.Length > "_pkg_version".Length;
+    }
+
+    private static List<PkgEntry> ReadEntries(string manifest)
+    {
+        var entries = new List<PkgEntry>();
+
         foreach (string line in File.ReadLines(manifest, Encoding.UTF8))
         {
             PkgEntry? entry = ParseLine(line);
-
-            if (entry == null || string.IsNullOrWhiteSpace(entry.RemoteName))
+            if (entry != null)
             {
-                continue;
+                entries.Add(entry);
             }
-
-            expectedFiles.Add(NormalizePath(entry.RemoteName));
         }
+
+        return entries;
     }
 
     private static List<string> FindUnlistedFiles(HashSet<string> expectedFiles)
@@ -158,7 +238,7 @@ internal static class Verify
     private static bool IsUnlistedFilesPath(string normalizedPath)
     {
         return normalizedPath.Equals(UnlistedFilesDirectoryName, StringComparison.OrdinalIgnoreCase) ||
-               normalizedPath.StartsWith(UnlistedFilesDirectoryName + "/", StringComparison.OrdinalIgnoreCase);
+            normalizedPath.StartsWith(UnlistedFilesDirectoryName + "/", StringComparison.OrdinalIgnoreCase);
     }
 
     private static bool MoveUnlistedFiles(List<string> unlistedFiles)
@@ -179,8 +259,6 @@ internal static class Verify
             Logger.Error($"Failed to create {UnlistedFilesDirectoryName} directory: {ex.Message}");
             return false;
         }
-
-        Logger.Info($"Moving {unlistedFiles.Count} unlisted file(s) to {UnlistedFilesDirectoryName}...");
 
         foreach (string relativePath in unlistedFiles)
         {
@@ -210,7 +288,6 @@ internal static class Verify
                 }
 
                 File.Move(source, destination, true);
-                Logger.Info($"Moved unlisted file: {relativePath} -> {UnlistedFilesDirectoryName}/{relativePath}");
             }
             catch (Exception ex)
             {
@@ -219,16 +296,69 @@ internal static class Verify
             }
         }
 
-        if (success)
-        {
-            Logger.Info("Unlisted files moved successfully.");
-        }
-        else
+        if (!success)
         {
             Logger.Warning("One or more unlisted files could not be moved.");
         }
 
         return success;
+    }
+
+    private static bool DeleteUnlistedFilesDirectory()
+    {
+        string directory = Path.Combine(Directory.GetCurrentDirectory(), UnlistedFilesDirectoryName);
+        if (!Directory.Exists(directory))
+        {
+            return true;
+        }
+
+        try
+        {
+            foreach (string file in Directory.EnumerateFiles(directory, "*", SearchOption.AllDirectories))
+            {
+                EnsureWritableFile(file);
+            }
+
+            foreach (string subdirectory in Directory.EnumerateDirectories(directory, "*", SearchOption.AllDirectories))
+            {
+                EnsureWritableDirectory(subdirectory);
+            }
+
+            EnsureWritableDirectory(directory);
+            Directory.Delete(directory, true);
+
+            if (Directory.Exists(directory))
+            {
+                throw new IOException($"Directory still exists after deletion: {directory}");
+            }
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Logger.Error($"Failed to remove {UnlistedFilesDirectoryName}: {ex.Message}");
+            return false;
+        }
+    }
+
+    private static void EnsureWritableDirectory(string path)
+    {
+        try
+        {
+            FileAttributes attributes = File.GetAttributes(path);
+            if ((attributes & FileAttributes.ReadOnly) != 0)
+            {
+                File.SetAttributes(path, attributes & ~FileAttributes.ReadOnly);
+            }
+        }
+        catch {}
+    }
+
+    private static bool IsManifestFileName(string fileName)
+    {
+        return fileName.Equals("pkg_version", StringComparison.OrdinalIgnoreCase) ||
+            (fileName.EndsWith("_pkg_version", StringComparison.OrdinalIgnoreCase) &&
+             fileName.Length > "_pkg_version".Length);
     }
 
     private static bool IsIgnoredUnlistedFile(string relativePath)
@@ -242,7 +372,7 @@ internal static class Verify
         if (NonGameFiles.Contains(normalized))
             return true;
 
-        if (PkgFiles.Any(x => string.Equals(x, fileName, StringComparison.OrdinalIgnoreCase)))
+        if (IsManifestFileName(fileName))
         {
             return true;
         }
@@ -358,80 +488,81 @@ internal static class Verify
 
     private static VerifyStats VerifyFile(
         string pkgFile,
+        List<PkgEntry> entries,
         List<string> failures)
     {
-        var entries = new List<PkgEntry>();
-
-        foreach (string line in File.ReadLines(pkgFile, Encoding.UTF8))
-        {
-            PkgEntry? entry = ParseLine(line);
-
-            if (entry != null)
-                entries.Add(entry);
-        }
-
         int total = entries.Count;
+        int processed = 0;
+        const string progressLabel = "VERIFY";
         int ok = 0;
         int missing = 0;
         int sizeFail = 0;
         int md5Fail = 0;
 
-        Logger.Info($"Processing {pkgFile} ...");
+        if (total > 0)
+        {
+            Logger.Progress(progressLabel, 0, total);
+        }
 
         for (int i = 0; i < entries.Count; i++)
         {
             PkgEntry entry = entries[i];
             int index = i + 1;
 
-            if (!File.Exists(entry.RemoteName))
+            try
             {
-                string message = $"{index}/{total} [MISSING] " + $"{entry.RemoteName}";
-                Logger.Warning(message);
-                failures.Add($"[{pkgFile}] {message}");
-                missing++;
-                continue;
+                if (!File.Exists(entry.RemoteName))
+                {
+                    string message = $"{index}/{total} [MISSING] " + $"{entry.RemoteName}";
+                    failures.Add($"[{pkgFile}] {message}");
+                    missing++;
+                    continue;
+                }
+
+                long actualSize = new FileInfo(entry.RemoteName).Length;
+
+                if (actualSize != entry.FileSize)
+                {
+                    long diff = actualSize - entry.FileSize;
+
+                    string message =
+                        $"{index}/{total} [SIZE FAIL] " +
+                        $"{entry.RemoteName} | " +
+                        $"expected={FormatSize(entry.FileSize)} " +
+                        $"got={FormatSize(actualSize)} " +
+                        $"diff={diff:+#;-#;+0} bytes";
+
+                    failures.Add($"[{pkgFile}] {message}");
+                    sizeFail++;
+                    continue;
+                }
+
+                string actualMd5 = CalculateMd5(entry.RemoteName);
+
+                if (!string.Equals(actualMd5, entry.Md5, StringComparison.OrdinalIgnoreCase))
+                {
+                    string message =
+                        $"{index}/{total} [MD5 FAIL] " +
+                        $"{entry.RemoteName} | " +
+                        $"{FormatSize(actualSize)}";
+
+                    failures.Add($"[{pkgFile}] {message}");
+                    md5Fail++;
+                    continue;
+                }
+
+                ok++;
             }
-
-            long actualSize = new FileInfo(entry.RemoteName).Length;
-
-            if (actualSize != entry.FileSize)
+            finally
             {
-                long diff = actualSize - entry.FileSize;
-
-                string message =
-                    $"{index}/{total} [SIZE FAIL] " +
-                    $"{entry.RemoteName} | " +
-                    $"expected={FormatSize(entry.FileSize)} " +
-                    $"got={FormatSize(actualSize)} " +
-                    $"diff={diff:+#;-#;+0} bytes";
-
-                Logger.Warning(message);
-                failures.Add($"[{pkgFile}] {message}");
-                sizeFail++;
-                continue;
+                processed++;
+                Logger.Progress(progressLabel, processed, total);
             }
+        }
 
-            string actualMd5 = CalculateMd5(entry.RemoteName);
-
-            if (!string.Equals(actualMd5, entry.Md5, StringComparison.OrdinalIgnoreCase))
-            {
-                string message =
-                    $"{index}/{total} [MD5 FAIL] " +
-                    $"{entry.RemoteName} | " +
-                    $"{FormatSize(actualSize)}";
-
-                Logger.Warning(message);
-                failures.Add($"[{pkgFile}] {message}");
-                md5Fail++;
-                continue;
-            }
-
-            Logger.Info(
-                $"{index}/{total} [OK] " +
-                $"{entry.RemoteName} | " +
-                $"{FormatSize(actualSize)}");
-
-            ok++;
+        if (total > 0)
+        {
+            Logger.CompleteProgress(progressLabel, total);
         }
 
         return new VerifyStats(total, ok, missing, sizeFail, md5Fail);

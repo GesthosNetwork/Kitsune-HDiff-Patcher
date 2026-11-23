@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Globalization;
 using System.Linq;
 using System.Text;
 using System.Text.Json;
@@ -55,10 +56,16 @@ internal static class Patch
     private static readonly Regex MULTIPART_ANY_RAR_PART_REGEX =
         new(@"\.part\d+\.rar$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
-    private static string? GAME_VERSION = null;
+    private static readonly Regex SEVEN_ZIP_PERCENT_REGEX =
+        new(@"^\s*(\d{1,3})%", RegexOptions.Compiled);
+
     private static bool pending_delete_for_migration = false;
 
     private static readonly HashSet<string> deleteList = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly List<string> processedArchives = new();
+
+    public static IReadOnlyList<string> ProcessedArchives => processedArchives;
+    public static bool HasAppliedPatches { get; private set; }
 
     private static string? HPATCHZ_PATH;
     private static string? SEVEN_ZIP_PATH;
@@ -68,25 +75,21 @@ internal static class Patch
         try
         {
             deleteList.Clear();
-            GAME_VERSION = null;
+            processedArchives.Clear();
             pending_delete_for_migration = false;
+            HasAppliedPatches = false;
 
             Program.SetTitle("Detecting game folder...");
             var gameFolder = DetectGameFolder();
+            Logger.Info($"Game folder: {gameFolder.Name}");
 
             Program.SetTitle("Preparing tools...");
             CheckTools();
 
             bool patch_done = false;
 
-            Program.SetTitle("Processing multipart archives...");
-            if (ExtractAllMultipartAndProcess(gameFolder))
-            {
-                patch_done = true;
-            }
-
-            Program.SetTitle("Processing archives...");
             var cwd = Directory.GetCurrentDirectory();
+            var multipartArchives = GetMultipartFirstParts();
             var candidates = new List<string>();
             candidates.AddRange(Directory.GetFiles(cwd, "*.zip", SearchOption.TopDirectoryOnly));
             candidates.AddRange(Directory.GetFiles(cwd, "*.7z", SearchOption.TopDirectoryOnly));
@@ -100,36 +103,68 @@ internal static class Patch
                 .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
                 .ToList();
 
-            foreach (var archive_name in filtered)
+            int totalArchives = multipartArchives.Count + filtered.Count;
+            Logger.Info(totalArchives == 0
+                ? "No update archives found."
+                : $"Found {totalArchives} update archive(s).");
+
+            int archiveIndex = 0;
+            foreach (FileInfo first in multipartArchives)
             {
+                archiveIndex++;
+                Program.SetTitle($"Processing {ShortTitleText(first.Name)}");
+                Logger.Archive(LogicalNameFromFirst(first), archiveIndex, totalArchives);
+
+                try
+                {
+                    bool archivedPatched = ExtractMultipartAndProcess(first, gameFolder);
+                    patch_done |= archivedPatched;
+                    if (archivedPatched)
+                    {
+                        processedArchives.Add(LogicalNameFromFirst(first));
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Logger.Error($"Error processing multipart {first.Name}: {ex.Message}");
+                }
+            }
+
+            foreach (string archive_name in filtered)
+            {
+                archiveIndex++;
                 var archive_path = new FileInfo(archive_name);
-                ExtractSingleArchive(archive_path);
+                Program.SetTitle($"Processing {ShortTitleText(archive_name)}");
+                Logger.Archive(archive_name, archiveIndex, totalArchives);
 
-                if (ProcessLogicalArchive(archive_name, gameFolder))
+                try
                 {
-                    patch_done = true;
+                    ExtractSingleArchive(archive_path);
+                    bool archivedPatched = ProcessLogicalArchive(archive_name, gameFolder);
+                    patch_done |= archivedPatched;
+                    if (archivedPatched)
+                    {
+                        processedArchives.Add(archive_name);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Logger.Error($"Error processing archive {archive_name}: {ex.Message}");
+                    throw;
                 }
             }
 
-            if (patch_done)
+            Program.SetTitle("Processing remaining HDiff patches...");
+            if (HasHDiffInputs())
             {
-                Program.SetTitle("Detecting game version...");
-                GAME_VERSION = DetectGameVersionAfterPatch(gameFolder);
-
-                if (pending_delete_for_migration)
-                {
-                    Program.SetTitle("Deleting obsolete files...");
-                    DeleteFiles();
-                }
-
-                if (GAME_VERSION != null)
-                {
-                    Program.SetTitle("Writing configuration...");
-                    WriteConfigIni();
-                }
+                patch_done |= ApplyHDiff();
             }
 
-            Logger.Info("Patching finished.");
+            if (patch_done && pending_delete_for_migration)
+            {
+                Program.SetTitle("Deleting obsolete files...");
+                DeleteFiles();
+            }
 
             Program.SetTitle("Cleaning temporary files...");
             if (!CleanupAuxFiles(gameFolder))
@@ -140,6 +175,7 @@ internal static class Patch
             Program.SetTitle("Removing empty directories...");
             CleanupEmptyDirs(gameFolder);
             CleanupEmptyDirsRoot();
+            Logger.Info("Cleanup completed.\n");
 
             return 0;
         }
@@ -149,6 +185,17 @@ internal static class Patch
             Logger.Error(ex.Message);
             return 1;
         }
+    }
+
+    private static bool HasHDiffInputs()
+    {
+        if (File.Exists("hdifffiles.txt") || File.Exists("hdiffmap.json"))
+        {
+            return true;
+        }
+
+        return Directory.EnumerateFiles(
+            Directory.GetCurrentDirectory(), "*.hdiff", SearchOption.AllDirectories).Any();
     }
 
     private static string NormalizeText(string value)
@@ -176,6 +223,44 @@ internal static class Patch
     private static bool IsVersionAtLeast(int major, int minor, int targetMajor, int targetMinor)
     {
         return major > targetMajor || (major == targetMajor && minor >= targetMinor);
+    }
+
+    private static int[] ParseVersionParts(string version)
+    {
+        var parts = version.Split('.', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(int.Parse)
+            .ToArray();
+
+        if (parts.Length == 0 || parts.Length > 3)
+        {
+            throw new FormatException($"Invalid version: {version}");
+        }
+
+        return [.. parts, .. Enumerable.Repeat(0, 3 - parts.Length)];
+    }
+
+    private static int CompareVersions(string left, string right)
+    {
+        var a = ParseVersionParts(left);
+        var b = ParseVersionParts(right);
+
+        for (int i = 0; i < 3; i++)
+        {
+            int comparison = a[i].CompareTo(b[i]);
+            if (comparison != 0)
+            {
+                return comparison;
+            }
+        }
+
+        return 0;
+    }
+
+    private static bool SupportsAudioMigration(DirectoryInfo gameFolder)
+    {
+        return gameFolder.Name.Equals("GenshinImpact_Data", StringComparison.OrdinalIgnoreCase)
+            || gameFolder.Name.Equals("Genshin_Data", StringComparison.OrdinalIgnoreCase)
+            || gameFolder.Name.Equals("YuanShen_Data", StringComparison.OrdinalIgnoreCase);
     }
 
     private static string NormalizePathText(string path)
@@ -285,16 +370,16 @@ internal static class Patch
         EnsureWritable(path);
     }
 
-    private static int RunProcess(string exe, IEnumerable<string> args)
+    private static (int ExitCode, string Output) RunProcess(string exe, IEnumerable<string> args)
     {
         var psi = new ProcessStartInfo
         {
             FileName = exe,
             WorkingDirectory = Directory.GetCurrentDirectory(),
             UseShellExecute = false,
-            CreateNoWindow = false,
-            RedirectStandardOutput = false,
-            RedirectStandardError = false
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true
         };
 
         foreach (var arg in args)
@@ -309,9 +394,320 @@ internal static class Patch
             throw new Exception($"Failed start process: {exe}");
         }
 
+        Task<string> outputTask = process.StandardOutput.ReadToEndAsync();
+        Task<string> errorTask = process.StandardError.ReadToEndAsync();
+        process.WaitForExit();
+        Task.WaitAll(outputTask, errorTask);
+
+        string output = string.Join(
+            Environment.NewLine,
+            new[] { outputTask.Result, errorTask.Result }
+                .Where(value => !string.IsNullOrWhiteSpace(value)));
+
+        return (process.ExitCode, output);
+    }
+
+    private static string FormatProcessFailure(int exitCode, string output)
+    {
+        string detail = output
+            .Replace('\r', ' ')
+            .Replace('\n', ' ')
+            .Trim();
+
+        if (detail.Length > 1200)
+        {
+            detail = detail[^1200..];
+        }
+
+        return string.IsNullOrWhiteSpace(detail)
+            ? $"hpatchz exit code {exitCode}"
+            : $"hpatchz exit code {exitCode}: {detail}";
+    }
+
+    private sealed class ArchiveProgressTracker
+    {
+        private readonly object sync = new();
+        private readonly int totalFiles;
+        private int processedFiles;
+        private double? sevenZipPercent;
+
+        public ArchiveProgressTracker(int totalFiles)
+        {
+            this.totalFiles = totalFiles;
+        }
+
+        public void FileCompleted()
+        {
+            lock (sync)
+            {
+                if (processedFiles < totalFiles)
+                {
+                    processedFiles++;
+                }
+
+                double percent = sevenZipPercent ?? processedFiles / (double)totalFiles * 100d;
+                Logger.ProgressPercent("ARCHIVE", percent, processedFiles, totalFiles);
+            }
+        }
+
+        public void ReportSevenZipPercent(int percent)
+        {
+            lock (sync)
+            {
+                double nextPercent = Math.Clamp(percent, 0, 100);
+                sevenZipPercent = Math.Max(sevenZipPercent ?? 0d, nextPercent);
+                Logger.ProgressPercent("ARCHIVE", sevenZipPercent.Value, processedFiles, totalFiles);
+            }
+        }
+    }
+
+    private static int RunSevenZipProcess(string exe, IEnumerable<string> args, int totalFiles)
+    {
+        var psi = new ProcessStartInfo
+        {
+            FileName = exe,
+            WorkingDirectory = Directory.GetCurrentDirectory(),
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true
+        };
+
+        foreach (var arg in args)
+        {
+            psi.ArgumentList.Add(arg);
+        }
+
+        using var process = Process.Start(psi);
+
+        if (process == null)
+        {
+            throw new Exception($"Failed start process: {exe}");
+        }
+
+        var progress = new ArchiveProgressTracker(totalFiles);
+        Task fileProgressTask = ReadSevenZipFileOutputAsync(process.StandardOutput, progress);
+        Task<string> errorTask = ReadSevenZipErrorAndProgressAsync(process.StandardError, progress);
         process.WaitForExit();
 
+        Task.WaitAll(fileProgressTask, errorTask);
+        string error = errorTask.GetAwaiter().GetResult();
+
+        if (process.ExitCode != 0)
+        {
+            string detail = error.Trim();
+            if (detail.Length > 1200)
+            {
+                detail = detail[^1200..];
+            }
+
+            string message = $"7z extraction failed with exit code {process.ExitCode}";
+            if (!string.IsNullOrWhiteSpace(detail))
+            {
+                message += $": {detail}";
+            }
+
+            throw new Exception(message);
+        }
+
+        if (totalFiles > 0)
+        {
+            Logger.CompleteProgress("ARCHIVE", totalFiles);
+        }
+
         return process.ExitCode;
+    }
+
+    private static async Task ReadSevenZipFileOutputAsync(
+        StreamReader reader,
+        ArchiveProgressTracker progress)
+    {
+        var buffer = new char[512];
+        var line = new StringBuilder();
+
+        while (true)
+        {
+            int read = await reader.ReadAsync(buffer, 0, buffer.Length);
+            if (read == 0)
+            {
+                break;
+            }
+
+            for (int i = 0; i < read; i++)
+            {
+                char current = buffer[i];
+
+                if (current is '\r' or '\n')
+                {
+                    CountExtractedFile(line.ToString(), progress);
+                    line.Clear();
+                }
+                else if (!char.IsControl(current))
+                {
+                    line.Append(current);
+                }
+            }
+        }
+
+        if (line.Length > 0)
+        {
+            CountExtractedFile(line.ToString(), progress);
+        }
+    }
+
+    private static async Task<string> ReadSevenZipErrorAndProgressAsync(
+        StreamReader reader,
+        ArchiveProgressTracker progress)
+    {
+        var buffer = new char[512];
+        var line = new StringBuilder();
+        var errorOutput = new StringBuilder();
+
+        while (true)
+        {
+            int read = await reader.ReadAsync(buffer, 0, buffer.Length);
+            if (read == 0)
+            {
+                break;
+            }
+
+            for (int i = 0; i < read; i++)
+            {
+                char current = buffer[i];
+
+                if (current is '\r' or '\n')
+                {
+                    ProcessSevenZipErrorLine(line.ToString(), progress, errorOutput);
+                    line.Clear();
+                }
+                else if (!char.IsControl(current))
+                {
+                    line.Append(current);
+                }
+            }
+        }
+
+        if (line.Length > 0)
+        {
+            ProcessSevenZipErrorLine(line.ToString(), progress, errorOutput);
+        }
+
+        return errorOutput.ToString();
+    }
+
+    private static void ProcessSevenZipErrorLine(
+        string outputLine,
+        ArchiveProgressTracker progress,
+        StringBuilder errorOutput)
+    {
+        string trimmed = outputLine.Trim();
+        if (trimmed.Length == 0)
+        {
+            return;
+        }
+
+        Match percentMatch = SEVEN_ZIP_PERCENT_REGEX.Match(trimmed);
+        if (percentMatch.Success &&
+            int.TryParse(percentMatch.Groups[1].Value, NumberStyles.None, CultureInfo.InvariantCulture, out int percent))
+        {
+            progress.ReportSevenZipPercent(percent);
+            return;
+        }
+
+        errorOutput.AppendLine(trimmed);
+    }
+
+    private static void CountExtractedFile(string outputLine, ArchiveProgressTracker progress)
+    {
+        string trimmed = outputLine.TrimStart();
+        if (!trimmed.StartsWith("+ ", StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        progress.FileCompleted();
+    }
+
+    private static int GetArchiveFileCount(FileInfo archive)
+    {
+        string sevenZip = SEVEN_ZIP_PATH ?? throw new InvalidOperationException("7z.exe not loaded.");
+        (int exitCode, string output) = RunProcess(sevenZip, new[] { "l", "-slt", archive.FullName });
+
+        if (exitCode != 0)
+        {
+            string detail = output.Trim();
+            if (detail.Length > 1200)
+            {
+                detail = detail[^1200..];
+            }
+
+            throw new Exception(string.IsNullOrWhiteSpace(detail)
+                ? $"Unable to read archive file list: {archive.Name}"
+                : $"Unable to read archive file list: {archive.Name}: {detail}");
+        }
+
+        int fileCount = 0;
+        bool entriesStarted = false;
+        bool hasPath = false;
+        bool isDirectory = false;
+
+        void CommitEntry()
+        {
+            if (hasPath && !isDirectory)
+            {
+                fileCount++;
+            }
+
+            hasPath = false;
+            isDirectory = false;
+        }
+
+        using var stringReader = new StringReader(output);
+        string? line;
+        while ((line = stringReader.ReadLine()) != null)
+        {
+            if (!entriesStarted)
+            {
+                if (line.Trim() == "----------")
+                {
+                    entriesStarted = true;
+                }
+
+                continue;
+            }
+
+            if (string.IsNullOrWhiteSpace(line))
+            {
+                CommitEntry();
+                continue;
+            }
+
+            if (line.StartsWith("Path = ", StringComparison.Ordinal))
+            {
+                hasPath = true;
+            }
+            else if (line.StartsWith("Folder = +", StringComparison.Ordinal))
+            {
+                isDirectory = true;
+            }
+            else if (line.StartsWith("Attributes = ", StringComparison.Ordinal))
+            {
+                string attributes = line["Attributes = ".Length..].TrimStart();
+                if (attributes.StartsWith("D", StringComparison.OrdinalIgnoreCase))
+                {
+                    isDirectory = true;
+                }
+            }
+        }
+
+        CommitEntry();
+
+        if (!entriesStarted)
+        {
+            throw new Exception($"Unrecognized 7z file listing format: {archive.Name}");
+        }
+
+        return fileCount;
     }
 
     private static void ReplaceTextInFile(string filepath)
@@ -333,7 +729,6 @@ internal static class Patch
             var dir = new DirectoryInfo(folder);
             if (dir.Exists)
             {
-                Logger.Info($"Detected game folder: {folder}");
                 return dir;
             }
         }
@@ -376,56 +771,90 @@ internal static class Patch
 
         ReplaceTextInFile(delete_txt);
 
-        foreach (var line in File.ReadAllLines(delete_txt, Encoding.UTF8))
+        List<string> entries = File.ReadAllLines(delete_txt, Encoding.UTF8)
+            .Select(line => line.Trim())
+            .Where(line => !string.IsNullOrWhiteSpace(line))
+            .ToList();
+
+        int total = entries.Count;
+        int processed = 0;
+        int deleted = 0;
+        int notFound = 0;
+        var failures = new List<string>();
+
+        if (total > 0)
         {
-            string raw = line.Trim();
-            if (string.IsNullOrWhiteSpace(raw))
-            {
-                continue;
-            }
+            Logger.Progress("DELETE", 0, total);
+        }
 
-            deleteList.Add(NormalizePathText(raw));
-
-            string target = raw;
+        foreach (string raw in entries)
+        {
             try
             {
-                target = Path.GetFullPath(raw);
-            }
-            catch {}
+                deleteList.Add(NormalizePathText(raw));
 
-            SetFileTitle("Deleting", target);
+                string target = raw;
+                try
+                {
+                    target = Path.GetFullPath(raw);
+                }
+                catch {}
 
-            if (!File.Exists(target) && !Directory.Exists(target))
-            {
-                continue;
-            }
+                SetFileTitle("Deleting", target);
 
-            MakeWritableRecursive(target);
+                if (!File.Exists(target) && !Directory.Exists(target))
+                {
+                    notFound++;
+                    continue;
+                }
 
-            try
-            {
+                MakeWritableRecursive(target);
+
                 if (File.Exists(target))
                 {
                     File.Delete(target);
-                    Logger.Info($"Deleted file: {target}");
                 }
                 else
                 {
                     Directory.Delete(target, true);
-                    Logger.Info($"Deleted directory tree: {target}");
                 }
+
+                deleted++;
             }
             catch (Exception ex)
             {
-                Logger.Warning($"Failed to delete {target}: {ex.Message}");
+                failures.Add($"Failed to delete '{raw}': {ex.Message}");
             }
+            finally
+            {
+                processed++;
+                if (total > 0)
+                {
+                    Logger.Progress("DELETE", processed, total);
+                }
+            }
+        }
+
+        if (total > 0)
+        {
+            Logger.CompleteProgress("DELETE", total);
+        }
+
+        Logger.Info($"Obsolete-file processing completed. Deleted: {deleted}; Not found: {notFound}; Failed: {failures.Count}.");
+
+        foreach (string failure in failures)
+        {
+            Logger.Warning(failure);
         }
 
         try
         {
             File.Delete(delete_txt);
         }
-        catch {}
+        catch (Exception ex)
+        {
+            Logger.Warning($"Failed to delete {delete_txt}: {ex.Message}");
+        }
     }
 
     private static List<(FileInfo Source, FileInfo Patch, FileInfo Target)> ReadHdiffmapJson()
@@ -475,9 +904,20 @@ internal static class Patch
         }
     }
 
+    private static void UpdatePatchProgress(ref int processed, int total)
+    {
+        if (total <= 0)
+        {
+            return;
+        }
+
+        processed++;
+        Logger.Progress("PATCH", processed, total);
+    }
+
     private static bool ApplyHDiff()
     {
-        bool patched = false;
+        Logger.Info("Processing HDiff patches...");
         bool hasHdiffFiles = File.Exists("hdifffiles.txt");
         bool hasHdiffMap = File.Exists("hdiffmap.json");
 
@@ -486,151 +926,193 @@ internal static class Patch
             return ApplyHDiffWithoutMapping();
         }
 
-        string hdifffiles_txt = "hdifffiles.txt";
+        string hdifffilesTxt = "hdifffiles.txt";
+        var targets = new List<string>();
+
         if (hasHdiffFiles)
         {
-            ReplaceTextInFile(hdifffiles_txt);
+            Logger.Info("HDiff map: hdifffiles.txt");
+            ReplaceTextInFile(hdifffilesTxt);
+            targets = File.ReadAllLines(hdifffilesTxt, Encoding.UTF8)
+                .Select(line => line.Trim())
+                .Where(target => !string.IsNullOrWhiteSpace(target))
+                .ToList();
+        }
 
-            foreach (var line in File.ReadAllLines(hdifffiles_txt, Encoding.UTF8))
+        List<(FileInfo Source, FileInfo Patch, FileInfo Target)> mapItems = hasHdiffMap
+            ? ReadHdiffmapJson()
+            : new List<(FileInfo Source, FileInfo Patch, FileInfo Target)>();
+
+        if (hasHdiffMap)
+        {
+            Logger.Info("HDiff map: hdiffmap.json");
+        }
+
+        int total = targets.Count + mapItems.Count;
+        int processed = 0;
+        int applied = 0;
+        int skipped = 0;
+        int failed = 0;
+        var warnings = new List<string>();
+
+        if (total == 0)
+        {
+            Logger.Info("No HDiff patches found in the mapping files.");
+            return false;
+        }
+
+        Logger.Progress("PATCH", 0, total);
+
+        foreach (string target in targets)
+        {
+            string originalFile = target;
+            string hdiff = $"{target}.hdiff";
+
+            if (!File.Exists(originalFile))
             {
-                string target = line.Trim();
-                if (string.IsNullOrWhiteSpace(target))
-                {
-                    continue;
-                }
+                skipped++;
+                warnings.Add($"Target file not found: {originalFile}");
+                UpdatePatchProgress(ref processed, total);
+                continue;
+            }
 
-                string original_file = target;
-                string hdiff = $"{target}.hdiff";
+            if (!File.Exists(hdiff))
+            {
+                skipped++;
+                warnings.Add($"Patch file not found: {hdiff}");
+                UpdatePatchProgress(ref processed, total);
+                continue;
+            }
 
-                if (!File.Exists(original_file))
-                {
-                    Logger.Warning($"Target file not found: {original_file}");
-                    continue;
-                }
+            EnsureWritable(originalFile);
 
-                if (!File.Exists(hdiff))
-                {
-                    Logger.Warning($"Patch file not found: {hdiff}");
-                    continue;
-                }
+            try
+            {
+                Program.SetTitle($"Patching {ShortTitleText(Path.GetFileName(originalFile))}");
 
-                EnsureWritable(original_file);
-
-                try
-                {
-                    Program.SetTitle($"Patching {ShortTitleText(Path.GetFileName(original_file))}");
-
-                    int code = RunProcess(
-                        HPATCHZ_PATH ?? throw new InvalidOperationException("hpatchz.exe not loaded."),
-                        new[]
-                        {
-                            "-f",
-                            Path.GetFullPath(original_file),
-                            Path.GetFullPath(hdiff),
-                            Path.GetFullPath(original_file)
-                        });
-
-                    if (code != 0)
+                (int code, string output) = RunProcess(
+                    HPATCHZ_PATH ?? throw new InvalidOperationException("hpatchz.exe not loaded."),
+                    new[]
                     {
-                        throw new Exception($"hpatchz exit code {code}");
-                    }
+                        "-f",
+                        Path.GetFullPath(originalFile),
+                        Path.GetFullPath(hdiff),
+                        Path.GetFullPath(originalFile)
+                    });
 
-                    patched = true;
-                    Logger.Info($"Patched (legacy): {original_file}");
-                }
-                catch (Exception ex)
+                if (code != 0)
                 {
-                    Logger.Error($"hpatchz failed for {original_file}: {ex.Message}");
-                    throw;
+                    throw new Exception(FormatProcessFailure(code, output));
                 }
 
-                try
-                {
-                    File.Delete(hdiff);
-                }
-                catch {}
+                applied++;
+                HasAppliedPatches = true;
+            }
+            catch (Exception ex)
+            {
+                failed++;
+                Logger.Error($"HDiff patching stopped. Applied: {applied}; Skipped: {skipped}; Failed: {failed}.");
+                throw new Exception($"hpatchz failed for {originalFile}: {ex.Message}", ex);
             }
 
             try
             {
-                File.Delete(hdifffiles_txt);
+                File.Delete(hdiff);
             }
             catch {}
+
+            UpdatePatchProgress(ref processed, total);
         }
 
-        if (hasHdiffMap)
+        foreach (var item in mapItems)
         {
-            foreach (var item in ReadHdiffmapJson())
+            var source = item.Source;
+            var patch = item.Patch;
+            var target = item.Target;
+
+            if (!source.Exists)
             {
-                var source = item.Source;
-                var patch = item.Patch;
-                var target = item.Target;
+                skipped++;
+                warnings.Add($"Source file not found: {source.FullName}");
+                UpdatePatchProgress(ref processed, total);
+                continue;
+            }
 
-                if (!source.Exists)
-                {
-                    Logger.Warning($"Source file not found: {source.FullName}");
-                    continue;
-                }
+            if (!patch.Exists)
+            {
+                skipped++;
+                warnings.Add($"Patch file not found: {patch.FullName}");
+                UpdatePatchProgress(ref processed, total);
+                continue;
+            }
 
-                if (!patch.Exists)
-                {
-                    Logger.Warning($"Patch file not found: {patch.FullName}");
-                    continue;
-                }
-
+            try
+            {
                 if (target.Directory != null)
                 {
                     target.Directory.Create();
                 }
 
                 EnsureWritable(source.FullName);
+                Program.SetTitle($"Patching {ShortTitleText(target.Name)}");
 
-                try
+                (int code, string output) = RunProcess(
+                    HPATCHZ_PATH ?? throw new InvalidOperationException("hpatchz.exe not loaded."),
+                    new[] { "-f", source.FullName, patch.FullName, target.FullName });
+
+                if (code != 0)
                 {
-                    Program.SetTitle($"Patching {ShortTitleText(target.Name)}");
+                    throw new Exception(FormatProcessFailure(code, output));
+                }
 
-                    int code = RunProcess(
-                        HPATCHZ_PATH ?? throw new InvalidOperationException("hpatchz.exe not loaded."),
-                        new[]
-                        {
-                            "-f", source.FullName, patch.FullName, target.FullName
-                        });
+                applied++;
+                HasAppliedPatches = true;
 
-                    if (code != 0)
+                if (!source.FullName.Equals(target.FullName, StringComparison.OrdinalIgnoreCase))
+                {
+                    try
                     {
-                        throw new Exception($"hpatchz exit code {code}");
+                        EnsureWritable(source.FullName);
+                        File.Delete(source.FullName);
                     }
-
-                    patched = true;
-                    Logger.Info($"Patched (map): {source.FullName} -> {target.FullName}");
-
-                    if (!source.FullName.Equals(target.FullName, StringComparison.OrdinalIgnoreCase))
+                    catch (Exception ex)
                     {
-                        try
-                        {
-                            EnsureWritable(source.FullName);
-                            File.Delete(source.FullName);
-                            Logger.Info($"Deleted old source file: {source.FullName}");
-                        }
-                        catch (Exception ex)
-                        {
-                            Logger.Warning($"Failed to delete old source file {source.FullName}: {ex.Message}");
-                        }
+                        warnings.Add($"Failed to delete old source file {source.FullName}: {ex.Message}");
                     }
                 }
-                catch (Exception ex)
-                {
-                    Logger.Error($"hpatchz failed for {source.FullName}: {ex.Message}");
-                    throw;
-                }
+            }
+            catch (Exception ex)
+            {
+                failed++;
+                Logger.Error($"HDiff patching stopped. Applied: {applied}; Skipped: {skipped}; Failed: {failed}.");
+                throw new Exception($"hpatchz failed for {source.FullName}: {ex.Message}", ex);
+            }
 
-                try
-                {
-                    File.Delete(patch.FullName);
-                }
-                catch {}
+            try
+            {
+                File.Delete(patch.FullName);
+            }
+            catch {}
+
+            UpdatePatchProgress(ref processed, total);
+        }
+
+        Logger.CompleteProgress("PATCH", total);
+        Logger.Info($"HDiff patching completed. Applied: {applied}; Skipped: {skipped}; Failed: {failed}.\n");
+
+        foreach (string warning in warnings)
+        {
+            Logger.Warning(warning);
+        }
+
+        try
+        {
+            if (hasHdiffFiles && File.Exists(hdifffilesTxt))
+            {
+                File.Delete(hdifffilesTxt);
             }
         }
+        catch {}
 
         try
         {
@@ -641,7 +1123,7 @@ internal static class Patch
         }
         catch {}
 
-        return patched;
+        return applied > 0;
     }
 
     private static bool ApplyHDiffWithoutMapping()
@@ -654,13 +1136,33 @@ internal static class Patch
             .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
             .ToList();
 
+        int total = hdiffFiles.Count;
+        if (total == 0)
+        {
+            return false;
+        }
+
+        int pairCount = hdiffFiles.Count(hdiff => File.Exists(hdiff[..^".hdiff".Length]));
+        Logger.Info("No mapping file found; using adjacent HDiff detection.");
+        Logger.Info($"Found {pairCount} adjacent HDiff pair(s).");
+
+        int processed = 0;
+        int applied = 0;
+        int skipped = 0;
+        int failed = 0;
+        var warnings = new List<string>();
+
+        Logger.Progress("PATCH", 0, total);
+
         foreach (string hdiff in hdiffFiles)
         {
             string source = hdiff[..^".hdiff".Length];
 
             if (!File.Exists(source))
             {
-                Logger.Warning($"Source file not found: {source}");
+                skipped++;
+                warnings.Add($"Source file not found: {source}");
+                UpdatePatchProgress(ref processed, total);
                 continue;
             }
 
@@ -670,7 +1172,7 @@ internal static class Patch
             {
                 Program.SetTitle($"Patching {ShortTitleText(Path.GetFileName(source))}");
 
-                int code = RunProcess(
+                (int code, string output) = RunProcess(
                     HPATCHZ_PATH ?? throw new InvalidOperationException("hpatchz.exe not loaded."),
                     new[]
                     {
@@ -679,16 +1181,18 @@ internal static class Patch
 
                 if (code != 0)
                 {
-                    throw new Exception($"hpatchz exit code {code}");
+                    throw new Exception(FormatProcessFailure(code, output));
                 }
 
                 patched = true;
-                Logger.Info($"Patched (adjacent): {source}");
+                applied++;
+                HasAppliedPatches = true;
             }
             catch (Exception ex)
             {
-                Logger.Error($"hpatchz failed for {source}: {ex.Message}");
-                throw;
+                failed++;
+                Logger.Error($"HDiff patching stopped. Applied: {applied}; Skipped: {skipped}; Failed: {failed}.");
+                throw new Exception($"hpatchz failed for {source}: {ex.Message}", ex);
             }
 
             try
@@ -696,6 +1200,16 @@ internal static class Patch
                 File.Delete(hdiff);
             }
             catch {}
+
+            UpdatePatchProgress(ref processed, total);
+        }
+
+        Logger.CompleteProgress("PATCH", total);
+        Logger.Info($"HDiff patching completed. Applied: {applied}; Skipped: {skipped}; Failed: {failed}.\n");
+
+        foreach (string warning in warnings)
+        {
+            Logger.Warning(warning);
         }
 
         return patched;
@@ -703,12 +1217,16 @@ internal static class Patch
 
     private static void ExtractWith7z(FileInfo archive)
     {
-        int code = RunProcess(
-            SEVEN_ZIP_PATH ?? throw new InvalidOperationException("7z.exe not loaded."),
+        string sevenZip = SEVEN_ZIP_PATH ?? throw new InvalidOperationException("7z.exe not loaded.");
+        int totalFiles = GetArchiveFileCount(archive);
+
+        int code = RunSevenZipProcess(
+            sevenZip,
             new[]
             {
-                "x", archive.FullName, "-o.", "-y"
-            });
+                "x", archive.FullName, "-o.", "-y", "-bb1", "-bso1", "-bsp2"
+            },
+            totalFiles);
 
         if (code != 0)
         {
@@ -817,7 +1335,6 @@ internal static class Patch
         try
         {
             Program.SetTitle($"Extracting {ShortTitleText(first.Name)}");
-            Logger.Info($"Processing multipart archive: {first.Name}");
             ExtractWith7z(first);
         }
         catch (Exception ex)
@@ -844,25 +1361,10 @@ internal static class Patch
     {
         string ln = name.ToLowerInvariant();
 
-        if (MULTIPART_FIRST_001_REGEX.IsMatch(ln))
-        {
-            return true;
-        }
-
-        if (MULTIPART_PART1_RAR_REGEX.IsMatch(ln))
-        {
-            return true;
-        }
-
-        if (MULTIPART_ANY_PART_REGEX.IsMatch(ln))
-        {
-            return true;
-        }
-
-        if (MULTIPART_ANY_RAR_PART_REGEX.IsMatch(ln))
-        {
-            return true;
-        }
+        if (MULTIPART_FIRST_001_REGEX.IsMatch(ln)) { return true; }
+        if (MULTIPART_PART1_RAR_REGEX.IsMatch(ln)) { return true; }
+        if (MULTIPART_ANY_PART_REGEX.IsMatch(ln)) { return true; }
+        if (MULTIPART_ANY_RAR_PART_REGEX.IsMatch(ln)) { return true; }
 
         return false;
     }
@@ -872,7 +1374,6 @@ internal static class Patch
         try
         {
             Program.SetTitle($"Extracting {ShortTitleText(archive.Name)}");
-            Logger.Info($"Processing archive: {archive.Name}");
             ExtractWith7z(archive);
         }
         catch (Exception ex)
@@ -906,7 +1407,7 @@ internal static class Patch
 
     private static bool MigrateAudioIfNeeded(DirectoryInfo gameFolder, string? versionFrom, string? versionTo)
     {
-        if (versionTo == null)
+        if (versionTo == null || !SupportsAudioMigration(gameFolder))
         {
             return false;
         }
@@ -915,19 +1416,7 @@ internal static class Patch
 
         try
         {
-            var parts = versionTo.Split('.', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-                .Select(int.Parse)
-                .ToArray();
-
-            if (parts.Length < 2)
-            {
-                return false;
-            }
-
-            int major = parts[0];
-            int minor = parts[1];
-
-            if (IsVersionLess(major, minor, 3, 6))
+            if (CompareVersions(versionTo, "3.5.50") < 0)
             {
                 return false;
             }
@@ -946,8 +1435,19 @@ internal static class Patch
         }
 
         Directory.CreateDirectory(newPath);
+        Logger.Info("Migrating audio files...");
 
-        foreach (var file in Directory.GetFiles(oldPath, "*", SearchOption.AllDirectories))
+        string[] audioFiles = Directory.GetFiles(oldPath, "*", SearchOption.AllDirectories);
+        int migrated = 0;
+        int failed = 0;
+        int processed = 0;
+
+        if (audioFiles.Length > 0)
+        {
+            Logger.Progress("MIGRATE", 0, audioFiles.Length);
+        }
+
+        foreach (var file in audioFiles)
         {
             try
             {
@@ -964,8 +1464,32 @@ internal static class Patch
                 {
                     File.Copy(file, destination, true);
                 }
+
+                migrated++;
             }
-            catch {}
+            catch
+            {
+                failed++;
+            }
+            finally
+            {
+                processed++;
+                if (audioFiles.Length > 0)
+                {
+                    Logger.Progress("MIGRATE", processed, audioFiles.Length);
+                }
+            }
+        }
+
+        if (audioFiles.Length > 0)
+        {
+            Logger.CompleteProgress("MIGRATE", audioFiles.Length);
+        }
+
+        Logger.Info($"Audio migration completed. Migrated: {migrated}; Failed: {failed}.");
+        if (failed > 0)
+        {
+            Logger.Warning($"{failed} audio file(s) could not be migrated.");
         }
 
         try
@@ -974,7 +1498,6 @@ internal static class Patch
         }
         catch {}
 
-        Logger.Success("Audio migration completed.");
         return true;
     }
 
@@ -985,23 +1508,14 @@ internal static class Patch
 
         bool needsMigration = false;
 
-        if (versions.From != null && versions.To != null)
+        if (SupportsAudioMigration(gameFolder) && versions.From != null && versions.To != null)
         {
             try
             {
-                var from = versions.From.Split('.', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-                    .Take(2).Select(int.Parse).ToArray();
+                bool oldVersion = CompareVersions(versions.From, "3.5.50") < 0;
+                bool newVersion = CompareVersions(versions.To, "3.5.50") >= 0;
 
-                var to = versions.To.Split('.', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-                    .Take(2).Select(int.Parse).ToArray();
-
-                bool oldVersion = IsVersionLess(from[0], from[1], 3, 6);
-                bool newVersion = IsVersionAtLeast(to[0], to[1], 3, 6);
-
-                if (oldVersion && newVersion)
-                {
-                    needsMigration = true;
-                }
+                needsMigration = oldVersion && newVersion;
             }
             catch
             {
@@ -1026,34 +1540,12 @@ internal static class Patch
         }
 
         Program.SetTitle("Applying patch...");
-        if (ApplyHDiff())
+        if (HasHDiffInputs() && ApplyHDiff())
         {
             patched = true;
         }
 
         return patched;
-    }
-
-    private static bool ExtractAllMultipartAndProcess(DirectoryInfo gameFolder)
-    {
-        bool patchedAny = false;
-
-        foreach (var first in GetMultipartFirstParts())
-        {
-            try
-            {
-                if (ExtractMultipartAndProcess(first, gameFolder))
-                {
-                    patchedAny = true;
-                }
-            }
-            catch (Exception ex)
-            {
-                Logger.Error($"Error processing multipart {first.Name}: {ex.Message}");
-            }
-        }
-
-        return patchedAny;
     }
 
     private static void CleanupEmptyDirs(DirectoryInfo gameFolder)
@@ -1109,7 +1601,6 @@ internal static class Patch
                     if (!Directory.EnumerateFileSystemEntries(dir).Any())
                     {
                         Directory.Delete(dir);
-                        Logger.Info($"Deleted empty directory (root): {dir}");
                         removed = true;
                     }
                 }
@@ -1121,25 +1612,6 @@ internal static class Patch
                 break;
             }
         }
-    }
-
-    private static void WriteConfigIni()
-    {
-        if (GAME_VERSION == null)
-        {
-            return;
-        }
-
-        string[] content =
-        [
-            "[General]",
-            "channel=1",
-            "cps=",
-            $"game_version={GAME_VERSION}",
-            "sub_channel=0"
-        ];
-
-        File.WriteAllLines("config.ini", content, new UTF8Encoding(false));
     }
 
     private static bool CleanupAuxFiles(DirectoryInfo gameFolder)
@@ -1305,7 +1777,6 @@ internal static class Patch
                 return false;
             }
 
-            Logger.Info($"Deleted {reason}: {path}");
             return true;
         }
         catch (Exception ex)
@@ -1334,7 +1805,6 @@ internal static class Patch
                 return false;
             }
 
-            Logger.Info($"Deleted {reason}: {path}");
             return true;
         }
         catch (Exception ex)
@@ -1342,83 +1812,5 @@ internal static class Patch
             Logger.Error($"Failed to delete {reason} {path}: {ex.Message}");
             return false;
         }
-    }
-
-    private static string? DetectGameVersionAfterPatch(DirectoryInfo gameFolder)
-    {
-        string settings_json = Path.Combine(gameFolder.FullName, "StreamingAssets", "asb_settings.json");
-        if (File.Exists(settings_json))
-        {
-            try
-            {
-                using var doc = JsonDocument.Parse(File.ReadAllText(settings_json, Encoding.UTF8));
-                if (doc.RootElement.TryGetProperty("variance", out var variance))
-                {
-                    var result = VERSION_REGEX.Match(variance.GetString() ?? "");
-                    if (result.Success)
-                    {
-                        return NormalizeVersion(result.Groups[1].Value);
-                    }
-                }
-            }
-            catch {}
-        }
-
-        string bin_ver = Path.Combine(gameFolder.FullName, "StreamingAssets", "BinaryVersion.bytes");
-        if (File.Exists(bin_ver))
-        {
-            try
-            {
-                string data = File.ReadAllText(bin_ver, Encoding.UTF8);
-                var match = VERSION_REGEX.Match(data);
-                if (match.Success)
-                {
-                    return NormalizeVersion(match.Groups[1].Value);
-                }
-            }
-            catch
-            {
-                try
-                {
-                    string data = Encoding.UTF8.GetString(File.ReadAllBytes(bin_ver));
-                    var match = VERSION_REGEX.Match(data);
-                    if (match.Success)
-                    {
-                        return NormalizeVersion(match.Groups[1].Value);
-                    }
-                }
-                catch {}
-            }
-        }
-
-        string version_info = "version_info";
-        if (File.Exists(version_info))
-        {
-            try
-            {
-                string data = File.ReadAllText(version_info, Encoding.UTF8);
-                var match = VERSION_REGEX.Match(data);
-                if (match.Success)
-                {
-                    return NormalizeVersion(match.Groups[1].Value);
-                }
-            }
-            catch
-            {
-                try
-                {
-                    string data = File.ReadAllText(version_info);
-                    var match = VERSION_REGEX.Match(data);
-                    if (match.Success)
-                    {
-                        return NormalizeVersion(match.Groups[1].Value);
-                    }
-                }
-                catch {}
-            }
-        }
-
-        Logger.Warning("Game version could not be detected after patch.");
-        return null;
     }
 }
