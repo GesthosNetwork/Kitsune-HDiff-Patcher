@@ -9,7 +9,7 @@
     <TargetFramework>net11.0</TargetFramework>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <SelfContained>true</SelfContained>
-    <Version>1.1.0</Version>
+    <Version>1.1.1</Version>
     <CurrentYear>$([System.DateTime]::Now.Year)</CurrentYear>
     <Copyright>Copyright © $(CurrentYear) GesthosNetwork</Copyright>
     <ImplicitUsings>enable</ImplicitUsings>

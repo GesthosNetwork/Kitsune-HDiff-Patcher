@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.IO.Compression;
 using System.Globalization;
 using System.Linq;
 using System.Text;
@@ -63,6 +64,12 @@ internal static class Patch
 
     private static readonly HashSet<string> deleteList = new(StringComparer.OrdinalIgnoreCase);
     private static readonly List<string> processedArchives = new();
+    private static readonly Dictionary<string, List<ArchiveEntry>> archiveEntryCache =
+        new(StringComparer.OrdinalIgnoreCase);
+    private static readonly List<FileInfo> pendingHashCleanupArchives = new();
+
+    private sealed record ArchiveEntry(string Path, bool IsDirectory);
+    private sealed record ArchiveJob(FileInfo Archive, bool IsMultipart, string LogicalName);
 
     public static IReadOnlyList<string> ProcessedArchives => processedArchives;
     public static bool HasAppliedPatches { get; private set; }
@@ -76,6 +83,8 @@ internal static class Patch
         {
             deleteList.Clear();
             processedArchives.Clear();
+            archiveEntryCache.Clear();
+            pendingHashCleanupArchives.Clear();
             pending_delete_for_migration = false;
             HasAppliedPatches = false;
 
@@ -94,63 +103,79 @@ internal static class Patch
             candidates.AddRange(Directory.GetFiles(cwd, "*.zip", SearchOption.TopDirectoryOnly));
             candidates.AddRange(Directory.GetFiles(cwd, "*.7z", SearchOption.TopDirectoryOnly));
             candidates.AddRange(Directory.GetFiles(cwd, "*.rar", SearchOption.TopDirectoryOnly));
+            candidates.AddRange(Directory.GetFiles(cwd, "*.tar.gz", SearchOption.TopDirectoryOnly));
 
             var filtered = candidates
                 .Select(Path.GetFileName)
                 .Where(x => !string.IsNullOrWhiteSpace(x))
                 .Cast<string>()
                 .Where(x => !IsPartFileName(x))
-                .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
                 .ToList();
 
-            int totalArchives = multipartArchives.Count + filtered.Count;
+            var archiveJobs = multipartArchives
+                .Select(first => new ArchiveJob(first, true, LogicalNameFromFirst(first)))
+                .Concat(filtered.Select(name =>
+                {
+                    var archive = new FileInfo(name);
+                    return new ArchiveJob(archive, false, name);
+                }))
+                .OrderBy(job => IsGameArchiveName(job.LogicalName) ? 0 : 1)
+                .ThenBy(job => job.LogicalName, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            foreach (ArchiveJob job in archiveJobs)
+            {
+                if (job.Archive.Name.EndsWith(".tar.gz", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                try
+                {
+                    _ = GetArchiveEntries(job.Archive);
+                }
+                catch {}
+            }
+
+            int totalArchives = archiveJobs.Count;
             Logger.Info(totalArchives == 0
                 ? "No update archives found."
                 : $"Found {totalArchives} update archive(s).");
 
             int archiveIndex = 0;
-            foreach (FileInfo first in multipartArchives)
+            foreach (ArchiveJob job in archiveJobs)
             {
                 archiveIndex++;
-                Program.SetTitle($"Processing {ShortTitleText(first.Name)}");
-                Logger.Archive(LogicalNameFromFirst(first), archiveIndex, totalArchives);
+                Program.SetTitle($"Processing {ShortTitleText(job.Archive.Name)}");
+                Logger.Archive(job.LogicalName, archiveIndex, totalArchives);
 
                 try
                 {
-                    bool archivedPatched = ExtractMultipartAndProcess(first, gameFolder);
+                    bool archivedPatched;
+                    if (job.IsMultipart)
+                    {
+                        archivedPatched = ExtractMultipartAndProcess(job.Archive, gameFolder);
+                    }
+                    else
+                    {
+                        ExtractSingleArchive(job.Archive);
+                        archivedPatched = ProcessLogicalArchive(job.LogicalName, gameFolder, job.Archive);
+                    }
+
                     patch_done |= archivedPatched;
                     if (archivedPatched)
                     {
-                        processedArchives.Add(LogicalNameFromFirst(first));
+                        processedArchives.Add(job.LogicalName);
                     }
                 }
                 catch (Exception ex)
                 {
-                    Logger.Error($"Error processing multipart {first.Name}: {ex.Message}");
-                }
-            }
-
-            foreach (string archive_name in filtered)
-            {
-                archiveIndex++;
-                var archive_path = new FileInfo(archive_name);
-                Program.SetTitle($"Processing {ShortTitleText(archive_name)}");
-                Logger.Archive(archive_name, archiveIndex, totalArchives);
-
-                try
-                {
-                    ExtractSingleArchive(archive_path);
-                    bool archivedPatched = ProcessLogicalArchive(archive_name, gameFolder);
-                    patch_done |= archivedPatched;
-                    if (archivedPatched)
+                    string kind = job.IsMultipart ? "multipart archive" : "archive";
+                    Logger.Error($"Error processing {kind} {job.Archive.Name}: {ex.Message}");
+                    if (!job.IsMultipart)
                     {
-                        processedArchives.Add(archive_name);
+                        throw;
                     }
-                }
-                catch (Exception ex)
-                {
-                    Logger.Error($"Error processing archive {archive_name}: {ex.Message}");
-                    throw;
                 }
             }
 
@@ -163,7 +188,12 @@ internal static class Patch
             if (patch_done && pending_delete_for_migration)
             {
                 Program.SetTitle("Deleting obsolete files...");
-                DeleteFiles();
+                DeleteFiles(pendingHashCleanupArchives.LastOrDefault());
+
+                foreach (FileInfo archive in pendingHashCleanupArchives)
+                {
+                    PrepareHashFilesForUpdate(archive);
+                }
             }
 
             Program.SetTitle("Cleaning temporary files...");
@@ -175,7 +205,6 @@ internal static class Patch
             Program.SetTitle("Removing empty directories...");
             CleanupEmptyDirs(gameFolder);
             CleanupEmptyDirsRoot();
-            Logger.Info("Cleanup completed.\n");
 
             return 0;
         }
@@ -628,10 +657,16 @@ internal static class Patch
         progress.FileCompleted();
     }
 
-    private static int GetArchiveFileCount(FileInfo archive)
+    private static List<ArchiveEntry> GetArchiveEntries(FileInfo archive)
     {
+        string archivePath = Path.GetFullPath(archive.FullName);
+        if (archiveEntryCache.TryGetValue(archivePath, out List<ArchiveEntry>? cached))
+        {
+            return cached;
+        }
+
         string sevenZip = SEVEN_ZIP_PATH ?? throw new InvalidOperationException("7z.exe not loaded.");
-        (int exitCode, string output) = RunProcess(sevenZip, new[] { "l", "-slt", archive.FullName });
+        (int exitCode, string output) = RunProcess(sevenZip, new[] { "l", "-slt", archivePath });
 
         if (exitCode != 0)
         {
@@ -646,19 +681,19 @@ internal static class Patch
                 : $"Unable to read archive file list: {archive.Name}: {detail}");
         }
 
-        int fileCount = 0;
+        var entries = new List<ArchiveEntry>();
         bool entriesStarted = false;
-        bool hasPath = false;
+        string? entryPath = null;
         bool isDirectory = false;
 
         void CommitEntry()
         {
-            if (hasPath && !isDirectory)
+            if (!string.IsNullOrWhiteSpace(entryPath))
             {
-                fileCount++;
+                entries.Add(new ArchiveEntry(entryPath, isDirectory));
             }
 
-            hasPath = false;
+            entryPath = null;
             isDirectory = false;
         }
 
@@ -684,7 +719,7 @@ internal static class Patch
 
             if (line.StartsWith("Path = ", StringComparison.Ordinal))
             {
-                hasPath = true;
+                entryPath = line["Path = ".Length..];
             }
             else if (line.StartsWith("Folder = +", StringComparison.Ordinal))
             {
@@ -707,7 +742,275 @@ internal static class Patch
             throw new Exception($"Unrecognized 7z file listing format: {archive.Name}");
         }
 
-        return fileCount;
+        archiveEntryCache[archivePath] = entries;
+        return entries;
+    }
+
+    private static HashSet<string> GetArchiveHashPaths(FileInfo archive)
+    {
+        var archiveHashPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        string archiveKey = Path.GetFullPath(archive.FullName);
+
+        if (!archiveEntryCache.TryGetValue(archiveKey, out List<ArchiveEntry>? entries))
+        {
+            return archiveHashPaths;
+        }
+
+        foreach (ArchiveEntry entry in entries)
+        {
+            if (entry.IsDirectory)
+            {
+                continue;
+            }
+
+            string relativePath = NormalizeArchivePath(entry.Path);
+            if (relativePath.EndsWith(".hash", StringComparison.OrdinalIgnoreCase))
+            {
+                archiveHashPaths.Add(relativePath);
+            }
+        }
+
+        return archiveHashPaths;
+    }
+
+    private static void PrepareHashFilesForUpdate(FileInfo currentArchive)
+    {
+        string archiveKey = Path.GetFullPath(currentArchive.FullName);
+
+        if (!archiveEntryCache.TryGetValue(archiveKey, out List<ArchiveEntry>? currentEntries))
+        {
+            return;
+        }
+
+        string root = Path.GetFullPath(Directory.GetCurrentDirectory());
+        HashSet<string> archiveHashPaths = GetArchiveHashPaths(currentArchive);
+        var affectedDirectories = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        HashSet<string> currentArchivePaths = currentEntries
+            .Where(entry => !entry.IsDirectory)
+            .Select(entry => NormalizeArchivePath(entry.Path))
+            .Where(path => path.Length > 0)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        foreach (string hdiffPath in currentArchivePaths
+            .Where(path => path.EndsWith(".hdiff", StringComparison.OrdinalIgnoreCase)))
+        {
+            string sourcePath = hdiffPath[..^".hdiff".Length];
+            AddHdiffTargetDirectory(sourcePath, hdiffPath, sourcePath, currentArchivePaths, affectedDirectories);
+        }
+
+        if (currentArchivePaths.Contains("hdifffiles.txt") && File.Exists("hdifffiles.txt"))
+        {
+            AddHdiffFileTargets(
+                File.ReadAllText("hdifffiles.txt", Encoding.UTF8),
+                currentArchivePaths,
+                affectedDirectories);
+        }
+
+        if (currentArchivePaths.Contains("hdiffmap.json") && File.Exists("hdiffmap.json"))
+        {
+            AddHdiffMapTargets(
+                File.ReadAllText("hdiffmap.json", Encoding.UTF8),
+                currentArchivePaths,
+                affectedDirectories);
+        }
+
+        foreach (string relativeDirectory in affectedDirectories)
+        {
+            string directory = relativeDirectory.Length == 0
+                ? root
+                : Path.GetFullPath(Path.Combine(root, relativeDirectory.Replace('/', Path.DirectorySeparatorChar)));
+
+            if (!Directory.Exists(directory))
+            {
+                continue;
+            }
+
+            foreach (string hashFile in Directory.EnumerateFiles(directory, "*", SearchOption.TopDirectoryOnly))
+            {
+                if (!hashFile.EndsWith(".hash", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                string relativeHashPath = NormalizeArchivePath(Path.GetRelativePath(root, hashFile));
+                if (archiveHashPaths.Contains(relativeHashPath))
+                {
+                    continue;
+                }
+
+                try
+                {
+                    EnsureWritable(hashFile);
+                    File.Delete(hashFile);
+                    if (File.Exists(hashFile))
+                    {
+                        throw new IOException("The file still exists after deletion.");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    throw new IOException("Unable to remove obsolete hash files for the current HDiff archive.", ex);
+                }
+            }
+        }
+    }
+
+    private static string NormalizeArchivePath(string path)
+    {
+        string normalized = path.Trim().Replace('\\', '/');
+        while (normalized.StartsWith("./", StringComparison.Ordinal))
+        {
+            normalized = normalized[2..];
+        }
+
+        return normalized.TrimStart('/');
+    }
+
+    private static bool TryResolveWorkingPath(string path, out string fullPath, out string relativePath)
+    {
+        fullPath = string.Empty;
+        relativePath = string.Empty;
+
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return false;
+        }
+
+        try
+        {
+            string root = Path.GetFullPath(Directory.GetCurrentDirectory());
+            string osPath = path.Trim()
+                .Replace('\\', Path.DirectorySeparatorChar)
+                .Replace('/', Path.DirectorySeparatorChar);
+            string combined = Path.IsPathRooted(osPath) ? osPath : Path.Combine(root, osPath);
+            fullPath = Path.GetFullPath(combined);
+
+            string relative = Path.GetRelativePath(root, fullPath);
+            if (relative == ".." ||
+                relative.StartsWith(".." + Path.DirectorySeparatorChar, StringComparison.Ordinal) ||
+                Path.IsPathRooted(relative))
+            {
+                fullPath = string.Empty;
+                return false;
+            }
+
+            relativePath = relative == "." ? string.Empty : NormalizeArchivePath(relative);
+            return true;
+        }
+        catch
+        {
+            fullPath = string.Empty;
+            relativePath = string.Empty;
+            return false;
+        }
+    }
+
+    private static void AddHdiffTargetDirectory(
+        string sourcePath,
+        string patchPath,
+        string targetPath,
+        HashSet<string> archivePaths,
+        HashSet<string> affectedDirectories)
+    {
+        if (!Path.GetExtension(targetPath).Equals(".pck", StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        if (!TryResolveWorkingPath(sourcePath, out string sourceFullPath, out _) || !File.Exists(sourceFullPath))
+        {
+            return;
+        }
+
+        bool patchAvailable = false;
+        if (TryResolveWorkingPath(patchPath, out string patchFullPath, out string patchRelativePath))
+        {
+            patchAvailable = File.Exists(patchFullPath) || archivePaths.Contains(patchRelativePath);
+        }
+
+        if (!patchAvailable || !TryResolveWorkingPath(targetPath, out string targetFullPath, out _))
+        {
+            return;
+        }
+
+        string targetDirectory = Path.GetDirectoryName(targetFullPath) ?? Directory.GetCurrentDirectory();
+        string root = Path.GetFullPath(Directory.GetCurrentDirectory());
+        string relativeDirectory = Path.GetRelativePath(root, targetDirectory);
+        affectedDirectories.Add(relativeDirectory == "." ? string.Empty : NormalizeArchivePath(relativeDirectory));
+    }
+
+    private static void AddHdiffFileTargets(
+        string content,
+        HashSet<string> archivePaths,
+        HashSet<string> affectedDirectories)
+    {
+        string normalizedContent = content.TrimStart('\uFEFF')
+            .Replace("{\"remoteName\": \"", string.Empty)
+            .Replace("\"}", string.Empty)
+            .Replace('/', '\\');
+
+        foreach (string target in normalizedContent.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries)
+            .Select(line => line.Trim())
+            .Where(line => line.Length > 0))
+        {
+            AddHdiffTargetDirectory(target, target + ".hdiff", target, archivePaths, affectedDirectories);
+        }
+    }
+
+    private static void AddHdiffMapTargets(
+        string content,
+        HashSet<string> archivePaths,
+        HashSet<string> affectedDirectories)
+    {
+        try
+        {
+            using JsonDocument document = JsonDocument.Parse(content.TrimStart('\uFEFF'));
+            if (!document.RootElement.TryGetProperty("diff_map", out JsonElement diffMap) ||
+                diffMap.ValueKind != JsonValueKind.Array)
+            {
+                return;
+            }
+
+            foreach (JsonElement entry in diffMap.EnumerateArray())
+            {
+                string? source = entry.TryGetProperty("source_file_name", out JsonElement sourceElement)
+                    ? sourceElement.GetString()
+                    : null;
+                string? patch = entry.TryGetProperty("patch_file_name", out JsonElement patchElement)
+                    ? patchElement.GetString()
+                    : null;
+                string? target = entry.TryGetProperty("target_file_name", out JsonElement targetElement)
+                    ? targetElement.GetString()
+                    : null;
+
+                if (string.IsNullOrWhiteSpace(source) ||
+                    string.IsNullOrWhiteSpace(patch) ||
+                    string.IsNullOrWhiteSpace(target))
+                {
+                    continue;
+                }
+
+                AddHdiffTargetDirectory(source, patch, target, archivePaths, affectedDirectories);
+            }
+        }
+        catch {}
+    }
+
+    private static string? TryReadArchiveTextEntry(FileInfo archive, string entryPath)
+    {
+        try
+        {
+            string sevenZip = SEVEN_ZIP_PATH ?? throw new InvalidOperationException("7z.exe not loaded.");
+            (int exitCode, string output) = RunProcess(
+                sevenZip,
+                new[] { "e", "-so", "-bso0", "-bsp0", archive.FullName, entryPath });
+
+            return exitCode == 0 ? output : null;
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     private static void ReplaceTextInFile(string filepath)
@@ -759,7 +1062,7 @@ internal static class Patch
         }
     }
 
-    private static void DeleteFiles()
+    private static void DeleteFiles(FileInfo? currentArchive = null)
     {
         Program.SetTitle("Deleting obsolete files...");
 
@@ -775,6 +1078,9 @@ internal static class Patch
             .Select(line => line.Trim())
             .Where(line => !string.IsNullOrWhiteSpace(line))
             .ToList();
+        HashSet<string> archiveHashPaths = currentArchive != null
+            ? GetArchiveHashPaths(currentArchive)
+            : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         int total = entries.Count;
         int processed = 0;
@@ -791,6 +1097,18 @@ internal static class Patch
         {
             try
             {
+                string normalizedHashPath = NormalizeArchivePath(raw);
+                if (TryResolveWorkingPath(raw, out _, out string resolvedHashPath))
+                {
+                    normalizedHashPath = resolvedHashPath;
+                }
+
+                if (normalizedHashPath.EndsWith(".hash", StringComparison.OrdinalIgnoreCase) &&
+                    archiveHashPaths.Contains(normalizedHashPath))
+                {
+                    continue;
+                }
+
                 deleteList.Add(NormalizePathText(raw));
 
                 string target = raw;
@@ -1217,8 +1535,57 @@ internal static class Patch
 
     private static void ExtractWith7z(FileInfo archive)
     {
+        if (archive.Name.EndsWith(".tar.gz", StringComparison.OrdinalIgnoreCase))
+        {
+            ExtractTarGzWith7z(archive);
+            return;
+        }
+
+        ExtractArchiveWith7z(archive);
+    }
+
+    private static void ExtractTarGzWith7z(FileInfo archive)
+    {
+        string tempDirectory = Path.Combine(Path.GetTempPath(), $"Kitsune-TarGz-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDirectory);
+
+        string tarFileName = archive.Name[..^".gz".Length];
+        string tarPath = Path.Combine(tempDirectory, tarFileName);
+
+        try
+        {
+            using (var input = File.OpenRead(archive.FullName))
+            using (var gzip = new GZipStream(input, CompressionMode.Decompress))
+            using (var output = new FileStream(tarPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            {
+                gzip.CopyTo(output);
+            }
+
+            var tarArchive = new FileInfo(tarPath);
+            List<ArchiveEntry> tarEntries = GetArchiveEntries(tarArchive);
+            archiveEntryCache[Path.GetFullPath(archive.FullName)] = tarEntries;
+            ExtractArchiveWith7z(tarArchive);
+        }
+        finally
+        {
+            try
+            {
+                if (Directory.Exists(tempDirectory))
+                {
+                    Directory.Delete(tempDirectory, recursive: true);
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"Unable to remove temporary TAR workspace: {ex.Message}");
+            }
+        }
+    }
+
+    private static void ExtractArchiveWith7z(FileInfo archive)
+    {
         string sevenZip = SEVEN_ZIP_PATH ?? throw new InvalidOperationException("7z.exe not loaded.");
-        int totalFiles = GetArchiveFileCount(archive);
+        int totalFiles = GetArchiveEntries(archive).Count(entry => !entry.IsDirectory);
 
         int code = RunSevenZipProcess(
             sevenZip,
@@ -1232,6 +1599,11 @@ internal static class Patch
         {
             throw new Exception($"7z extraction failed: {archive.Name}");
         }
+    }
+
+    private static bool IsGameArchiveName(string archiveName)
+    {
+        return Path.GetFileName(archiveName).StartsWith("game_", StringComparison.OrdinalIgnoreCase);
     }
 
     private static bool IsMultipartFirst(FileInfo file)
@@ -1354,7 +1726,7 @@ internal static class Patch
             catch {}
         }
 
-        return ProcessLogicalArchive(logical, gameFolder);
+        return ProcessLogicalArchive(logical, gameFolder, first);
     }
 
     private static bool IsPartFileName(string name)
@@ -1371,15 +1743,8 @@ internal static class Patch
 
     private static void ExtractSingleArchive(FileInfo archive)
     {
-        try
-        {
-            Program.SetTitle($"Extracting {ShortTitleText(archive.Name)}");
-            ExtractWith7z(archive);
-        }
-        catch (Exception ex)
-        {
-            Logger.Error($"Failed to extract {archive}: {ex.Message}");
-        }
+        Program.SetTitle($"Extracting {ShortTitleText(archive.Name)}");
+        ExtractWith7z(archive);
 
         try
         {
@@ -1501,7 +1866,7 @@ internal static class Patch
         return true;
     }
 
-    private static bool ProcessLogicalArchive(string archiveName, DirectoryInfo gameFolder)
+    private static bool ProcessLogicalArchive(string archiveName, DirectoryInfo gameFolder, FileInfo archiveFile)
     {
         bool patched = false;
         var versions = ParseFromToVersionsFromName(archiveName);
@@ -1532,11 +1897,13 @@ internal static class Patch
             }
 
             pending_delete_for_migration = true;
+            pendingHashCleanupArchives.Add(archiveFile);
         }
         else
         {
             Program.SetTitle("Deleting obsolete files...");
-            DeleteFiles();
+            DeleteFiles(archiveFile);
+            PrepareHashFilesForUpdate(archiveFile);
         }
 
         Program.SetTitle("Applying patch...");
@@ -1648,7 +2015,7 @@ internal static class Patch
             }
         }
 
-        string[] archivePatterns = [ "*.zip", "*.zip.*", "*.rar", "*.rar.*", "*.7z", "*.7z.*" ];
+        string[] archivePatterns = [ "*.zip", "*.zip.*", "*.rar", "*.rar.*", "*.7z", "*.7z.*", "*.tar.gz" ];
 
         foreach (string pattern in archivePatterns)
         {
